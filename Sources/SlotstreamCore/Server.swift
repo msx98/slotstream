@@ -424,6 +424,7 @@ public final class Server {
     }
 
     private static func messageError(_ json: [String: Any]) -> String? {
+        // Ollama path: strict — still rejects tool_calls/images as before
         guard let raw = json["messages"] as? [[String: Any]] else {
             return "messages must be an array"
         }
@@ -456,6 +457,67 @@ public final class Server {
                 }
             } else if m["content"] as? String == nil {
                 return "messages[\(i)].content must be text"
+            }
+        }
+        return nil
+    }
+
+    /// OpenAI path: permissive — allows tool_calls, tool role, and tool_call_id
+    private static func openAIMessageError(_ json: [String: Any]) -> String? {
+        guard let raw = json["messages"] as? [[String: Any]] else {
+            return "messages must be an array"
+        }
+        for (i, m) in raw.enumerated() {
+            let allowedKeys: Set<String> = ["role", "content", "tool_calls", "tool_call_id", "name"]
+            let extra = Set(m.keys).subtracting(allowedKeys)
+            if !extra.isEmpty {
+                return "messages[\(i)] has unsupported field(s): "
+                    + extra.sorted().joined(separator: ", ")
+            }
+            if m["images"] != nil {
+                return "messages[\(i)] uses images, which this server does not support"
+            }
+            guard let role = m["role"] as? String else {
+                return "messages[\(i)].role must be a string"
+            }
+            guard ["system", "user", "assistant", "tool", "developer"].contains(role) else {
+                return "messages[\(i)].role must be system, user, assistant, tool, or developer"
+            }
+            if role == "tool" {
+                // tool response: content must be text, tool_call_id recommended
+                if let c = m["content"], !(c is String) { return "messages[\(i)].content must be text" }
+                continue
+            }
+            // assistant may have tool_calls and null content
+            if let tc = m["tool_calls"] {
+                guard tc is [[String: Any]] || tc is [Any] else {
+                    return "messages[\(i)].tool_calls must be an array"
+                }
+            }
+            if let content = m["content"] {
+                if content is NSNull { continue }  // allowed when tool_calls present
+                if content is String { continue }
+                if let parts = content as? [[String: Any]] {
+                    for (j, part) in parts.enumerated() {
+                        let extra = Set(part.keys).subtracting(["type", "text", "image_url"])
+                        if !extra.isEmpty {
+                            return "messages[\(i)].content[\(j)] has unsupported field(s): "
+                                + extra.sorted().joined(separator: ", ")
+                        }
+                        let kind = (part["type"] as? String) ?? "text"
+                        if kind != "text" && kind != "input_text" && kind != "image_url" {
+                            // image_url ignored gracefully — not supported but don't trap
+                            continue
+                        }
+                        if kind == "text" || kind == "input_text" {
+                            if part["text"] as? String == nil {
+                                return "messages[\(i)] has a text part without text"
+                            }
+                        }
+                    }
+                } else {
+                    return "messages[\(i)].content must be text or array"
+                }
             }
         }
         return nil
@@ -505,11 +567,14 @@ public final class Server {
         if let e = modelError(json) { return e }
         let allowed: Set<String> = [
             "model", "messages", "stream", "temperature", "top_p", "top_k",
-            "presence_penalty", "max_tokens", "max_completion_tokens", "seed",
-            "stop", "stream_options",
+            "presence_penalty", "frequency_penalty", "max_tokens", "max_completion_tokens",
+            "seed", "stop", "stream_options",
+            "tools", "tool_choice", "parallel_tool_calls",
+            "response_format", "n", "user", "logit_bias", "logprobs", "top_logprobs",
+            "reasoning_effort", "verbosity",
         ]
         if let e = Self.unsupportedKey(json, allowed: allowed) { return e }
-        if let e = Self.messageError(json) { return e }
+        if let e = Self.openAIMessageError(json) { return e }
         for key in ["temperature", "top_p", "presence_penalty"]
         where json[key] != nil && Self.num(json[key]) == nil {
             return "\(key) must be a number"
@@ -543,7 +608,88 @@ public final class Server {
                 return "stream_options.include_usage must be true or false"
             }
         }
+        if let tools = json["tools"], !(tools is [[String: Any]]) && !(tools is [Any]) {
+            return "tools must be an array"
+        }
+        if let tc = json["tool_choice"] {
+            if !(tc is String) && !(tc is [String: Any]) {
+                return "tool_choice must be a string or object"
+            }
+        }
+        if json["parallel_tool_calls"] != nil, Self.bool(json["parallel_tool_calls"]) == nil {
+            return "parallel_tool_calls must be true or false"
+        }
         return nil
+    }
+
+    // MARK: OpenAI helpers
+
+    private static func openAITools(_ json: [String: Any]) -> [[String: Any]]? {
+        guard let arr = json["tools"] as? [[String: Any]] else { return nil }
+        return arr
+    }
+
+    private static func openAIMessagesForTemplate(_ json: [String: Any]) -> [[String: Any]] {
+        guard let raw = json["messages"] as? [[String: Any]] else { return [] }
+        return raw.map { m in
+            var out: [String: Any] = [:]
+            out["role"] = m["role"] as? String ?? "user"
+            // content may be string, array of parts, or null (assistant tool_calls)
+            if let c = m["content"] {
+                if c is NSNull { out["content"] = "" }
+                else if let s = c as? String { out["content"] = s }
+                else if let parts = c as? [[String: Any]] { out["content"] = contentText(parts as Any?) }
+                else { out["content"] = "" }
+            } else { out["content"] = "" }
+            if let tcs = m["tool_calls"] as? [[String: Any]] { out["tool_calls"] = tcs }
+            if let tcid = m["tool_call_id"] as? String { out["tool_call_id"] = tcid }
+            if let name = m["name"] as? String { out["name"] = name }
+            return out
+        }
+    }
+
+    /// Parse <tool_call> XML produced by the Qwen template into OpenAI tool_calls.
+    private static func parseToolCalls(from text: String) -> (content: String, calls: [[String: Any]]?) {
+        // Model emits: <tool_call><function=NAME><parameter=ARG>VAL</parameter>...</function></tool_call>
+        guard text.contains("<tool_call>") else { return (text, nil) }
+        let pattern = "<tool_call>\\s*<function=([^>]+)>\\s*(.*?)\\s*</function>\\s*</tool_call>"
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.dotMatchesLineSeparators]) else {
+            return (text, nil)
+        }
+        let ns = text as NSString
+        let matches = regex.matches(in: text, range: NSRange(location: 0, length: ns.length))
+        if matches.isEmpty { return (text, nil) }
+        var calls: [[String: Any]] = []
+        // content before first tool_call is treated as reasoning/content
+        let firstRange = matches[0].range
+        let prefix = ns.substring(with: NSRange(location: 0, length: firstRange.location)).trimmingCharacters(in: .whitespacesAndNewlines)
+        for (idx, m) in matches.enumerated() {
+            let name = ns.substring(with: m.range(at: 1)).trimmingCharacters(in: .whitespacesAndNewlines)
+            let inner = ns.substring(with: m.range(at: 2))
+            // inner contains <parameter=name>value</parameter> repeats
+            let pPattern = "<parameter=([^>]+)>\\s*(.*?)\\s*</parameter>"
+            let pRegex = try? NSRegularExpression(pattern: pPattern, options: [.dotMatchesLineSeparators])
+            var args: [String: Any] = [:]
+            if let pr = pRegex {
+                let pMatches = pr.matches(in: inner, range: NSRange(location: 0, length: (inner as NSString).length))
+                for pm in pMatches {
+                    let key = (inner as NSString).substring(with: pm.range(at: 1))
+                    let val = (inner as NSString).substring(with: pm.range(at: 2))
+                    // try to keep JSON types: if val looks like JSON, keep as string for OpenAI arguments (expects JSON string)
+                    args[key] = val
+                }
+            }
+            let argsJSON: String
+            if let data = try? JSONSerialization.data(withJSONObject: args, options: [.sortedKeys]), let s = String(data: data, encoding: .utf8) {
+                argsJSON = s
+            } else { argsJSON = "{}" }
+            calls.append([
+                "id": "call_\(idx)",
+                "type": "function",
+                "function": ["name": name, "arguments": argsJSON],
+            ])
+        }
+        return (prefix, calls.isEmpty ? nil : calls)
     }
 
     private func sampleParams(_ json: [String: Any]) -> SampleParams {
@@ -737,7 +883,6 @@ public final class Server {
                 status: "400 Bad Request", cors: cors)
             return
         }
-        let msgs = Self.messages(json)
         let stream = Self.bool(json["stream"]) ?? false
         var params = SampleParams.instruct
         if let v = Self.num(json["temperature"]) { params.temperature = Float(v) }
@@ -753,13 +898,15 @@ public final class Server {
         params = params.sanitized()
         let wantUsage = Self.bool(
             (json["stream_options"] as? [String: Any])?["include_usage"]) ?? false
-        guard !msgs.isEmpty else {
+        let tmplMessages = Self.openAIMessagesForTemplate(json)
+        let tmplTools = Self.openAITools(json)
+        guard !tmplMessages.isEmpty else {
             respondJSON(
                 fd, ["error": ["message": "messages must not be empty"]],
                 status: "400 Bad Request", cors: cors)
             return
         }
-        guard let ids = try? engine.encodeChat(msgs, thinking: false) else {
+        guard let ids = try? engine.encodeChatOpenAI(messages: tmplMessages, tools: tmplTools, thinking: false) else {
             respondJSON(
                 fd, ["error": ["message": "template failed"]],
                 status: "500 Internal Server Error", cors: cors)
@@ -784,14 +931,40 @@ public final class Server {
             alive = self.chunk(fd, Data("data: ".utf8) + data + Data("\n\n".utf8))
             return alive
         } : nil
-        let (text, _, stats) = engine.generate(
+        let (rawText, _, stats) = engine.generate(
             promptIds: ids, params: params,
             shouldContinue: { self.peerAlive(fd) }, onToken: callback)
+        let parsed = Self.parseToolCalls(from: rawText)
+        let text: String = parsed.content
+        let toolCalls = parsed.calls
+        let finishReason: String = toolCalls != nil ? "tool_calls" : stats.finishReason
         if stream, alive {
+            // If model produced tool calls, emit them as incremental deltas before the final
+            if let calls = toolCalls {
+                for (idx, call) in calls.enumerated() {
+                    let deltaObj: [String: Any] = [
+                        "id": rid, "object": "chat.completion.chunk",
+                        "created": Int(Date().timeIntervalSince1970), "model": self.engine.modelName,
+                        "choices": [[
+                            "index": 0,
+                            "delta": ["tool_calls": [[
+                                "index": idx,
+                                "id": call["id"] as? String ?? "call_\(idx)",
+                                "type": "function",
+                                "function": call["function"] ?? [:],
+                            ]]],
+                            "finish_reason": NSNull(),
+                        ]],
+                    ]
+                    let d = try! JSONSerialization.data(withJSONObject: deltaObj)
+                    alive = self.chunk(fd, Data("data: ".utf8) + d + Data("\n\n".utf8))
+                    if !alive { break }
+                }
+            }
             var fin: [String: Any] = [
                 "id": rid, "object": "chat.completion.chunk",
                 "created": Int(Date().timeIntervalSince1970), "model": engine.modelName,
-                "choices": [["index": 0, "delta": [:], "finish_reason": stats.finishReason]],
+                "choices": [["index": 0, "delta": [:], "finish_reason": finishReason]],
             ]
             if wantUsage {
                 fin["usage"] = [
@@ -804,6 +977,14 @@ public final class Server {
             chunk(fd, Data("data: [DONE]\n\n".utf8))
             endChunked(fd)
         } else {
+            var message: [String: Any] = ["role": "assistant"]
+            // OpenAI expects content to be string or null; null when tool_calls only
+            if let calls = toolCalls {
+                message["content"] = text.isEmpty ? NSNull() : text as Any
+                message["tool_calls"] = calls
+            } else {
+                message["content"] = text
+            }
             respondJSON(
                 fd,
                 [
@@ -811,8 +992,8 @@ public final class Server {
                     "created": Int(Date().timeIntervalSince1970), "model": engine.modelName,
                     "choices": [
                         [
-                            "index": 0, "finish_reason": stats.finishReason,
-                            "message": ["role": "assistant", "content": text],
+                            "index": 0, "finish_reason": finishReason,
+                            "message": message,
                         ]
                     ],
                     "usage": [

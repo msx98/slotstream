@@ -295,7 +295,7 @@ struct Serve: ParsableCommand {
     @Option var port: UInt16 = 11434
     @Option(name: .customLong("max-context"),
             help: "Longest prompt accepted, in tokens. Beyond it a request is refused rather than stalling: KV plus indexer state costs ~27 KiB per token on top of the memory plan, and prefill runs at tens of tokens a second.")
-    var maxContext: Int = 32_768
+    var maxContext: Int = 262144
     @Flag(name: .customLong("no-elastic"),
           help: "Pin the cache at its startup size. Default: an auto-sized cache resizes itself between requests as memory pressure and availability change (explicit size flags are always pinned).")
     var noElastic = false

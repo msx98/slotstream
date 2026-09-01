@@ -152,6 +152,27 @@ public final class Engine {
             additionalContext: ["enable_thinking": thinking])
     }
 
+    /// OpenAI path: messages already contain tool_calls / tool role etc, and tools
+    /// are forwarded to the Jinja template so the model sees the <tools> block.
+    public func encodeChatOpenAI(
+        messages: [[String: Any]], tools: [[String: Any]]?, thinking: Bool = false
+    ) throws -> [Int] {
+        // Tokenizer typealiases are [String: any Sendable]; bridging via cast.
+        let msgs: [[String: any Sendable]] = messages.map { dict in
+            var m: [String: any Sendable] = [:]
+            for (k, v) in dict { m[k] = v as any Sendable }
+            return m
+        }
+        let toolSpecs: [[String: any Sendable]]? = tools?.map { dict in
+            var t: [String: any Sendable] = [:]
+            for (k, v) in dict { t[k] = v as any Sendable }
+            return t
+        }
+        return try tokenizer.applyChatTemplate(
+            messages: msgs, tools: toolSpecs,
+            additionalContext: ["enable_thinking": thinking])
+    }
+
     /// Render a template without constructing the multi-GB model. Installer
     /// and API acceptance checks run this while a server is already live; the
     /// old implementation built a second Engine merely to load the tokenizer,

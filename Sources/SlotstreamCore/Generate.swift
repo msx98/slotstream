@@ -41,7 +41,7 @@ public struct SampleParams {
 
     /// Upper bound on a single response. Decode is the slow axis here, so an
     /// unbounded "until EOS" request needs a ceiling that is generous but finite.
-    public static let maxTokenCeiling = 32_768
+    public static let maxTokenCeiling = 262_144
 
     public static var instruct: SampleParams { SampleParams() }
     public static var thinking: SampleParams {
