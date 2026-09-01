@@ -4,6 +4,7 @@
 
 import CoreFoundation
 import Foundation
+import MLX
 
 public struct ServerError: Error, CustomStringConvertible {
     public let description: String
@@ -424,35 +425,45 @@ public final class Server {
     }
 
     private static func messageError(_ json: [String: Any]) -> String? {
-        // Ollama path: strict — still rejects tool_calls/images as before
+        // Ollama path: now accepts images (vision) alongside text
         guard let raw = json["messages"] as? [[String: Any]] else {
             return "messages must be an array"
         }
         for (i, m) in raw.enumerated() {
-            let extra = Set(m.keys).subtracting(["role", "content"])
+            let extra = Set(m.keys).subtracting(["role", "content", "images", "tool_calls", "tool_call_id"])
             if !extra.isEmpty {
                 return "messages[\(i)] has unsupported field(s): "
                     + extra.sorted().joined(separator: ", ")
             }
-            if m["tool_calls"] != nil || m["tool_call_id"] != nil || m["images"] != nil {
-                return "messages[\(i)] uses tools or images, which this server does not support"
+            if m["tool_calls"] != nil || m["tool_call_id"] != nil {
+                return "messages[\(i)] uses tools, which this server does not support on /api (use /v1)"
+            }
+            if let images = m["images"] {
+                guard images is [String] || images is [Any] else {
+                    return "messages[\(i)].images must be an array of base64 strings"
+                }
             }
             guard let role = m["role"] as? String,
                 ["system", "user", "assistant"].contains(role)
             else { return "messages[\(i)].role must be system, user, or assistant" }
             if let parts = m["content"] as? [[String: Any]] {
                 for (j, part) in parts.enumerated() {
-                    let extra = Set(part.keys).subtracting(["type", "text"])
+                    let extra = Set(part.keys).subtracting(["type", "text", "image_url", "image"])
                     if !extra.isEmpty {
                         return "messages[\(i)].content[\(j)] has unsupported field(s): "
                             + extra.sorted().joined(separator: ", ")
                     }
                     let kind = (part["type"] as? String) ?? "text"
-                    if kind != "text" && kind != "input_text" {
+                    if kind == "text" || kind == "input_text" {
+                        if part["text"] as? String == nil {
+                            return "messages[\(i)] has a text part without text"
+                        }
+                    } else if kind == "image_url" || kind == "image" {
+                        continue
+                    } else if part["image_url"] != nil || part["image"] != nil {
+                        continue
+                    } else {
                         return "messages[\(i)] contains unsupported content type '\(kind)'"
-                    }
-                    if part["text"] as? String == nil {
-                        return "messages[\(i)] has a text part without text"
                     }
                 }
             } else if m["content"] as? String == nil {
@@ -634,13 +645,31 @@ public final class Server {
         return raw.map { m in
             var out: [String: Any] = [:]
             out["role"] = m["role"] as? String ?? "user"
-            // content may be string, array of parts, or null (assistant tool_calls)
+            // Preserve structured content for vision (array with image_url) — tokenizer's
+            // render_content handles it and emits <|vision_start|><|image_pad|><|vision_end|>
             if let c = m["content"] {
                 if c is NSNull { out["content"] = "" }
                 else if let s = c as? String { out["content"] = s }
-                else if let parts = c as? [[String: Any]] { out["content"] = contentText(parts as Any?) }
-                else { out["content"] = "" }
+                else if let parts = c as? [[String: Any]] {
+                    let hasImage = parts.contains { $0["image_url"] != nil || $0["image"] != nil || ($0["type"] as? String) == "image_url" || ($0["type"] as? String) == "image" }
+                    out["content"] = hasImage ? parts : contentText(parts as Any?)
+                } else { out["content"] = "" }
             } else { out["content"] = "" }
+            // Ollama-style images field -> synthesize image_url content entries for template
+            if let images = m["images"] as? [String], !images.isEmpty {
+                var existing: [[String: Any]] = []
+                if let s = out["content"] as? String, !s.isEmpty {
+                    existing.append(["type": "text", "text": s])
+                } else if let arr = out["content"] as? [[String: Any]] {
+                    existing = arr
+                }
+                for b64 in images {
+                    // Use data URI so template sees an image; actual bytes not needed for tokenization phase
+                    let url = b64.hasPrefix("data:") ? b64 : "data:image/jpeg;base64,\(b64)"
+                    existing.append(["type": "image_url", "image_url": ["url": url]])
+                }
+                out["content"] = existing
+            }
             if let tcs = m["tool_calls"] as? [[String: Any]] { out["tool_calls"] = tcs }
             if let tcid = m["tool_call_id"] as? String { out["tool_call_id"] = tcid }
             if let name = m["name"] as? String { out["name"] = name }
@@ -719,21 +748,26 @@ public final class Server {
             respondJSON(fd, ["error": e], status: "400 Bad Request", cors: cors)
             return
         }
-        let msgs = Self.messages(json)
         let stream = Self.bool(json["stream"]) ?? true
         let thinking = Self.bool(json["think"]) ?? false
         let params = sampleParams(json)
-        guard !msgs.isEmpty else {
+        let tmplMessages = Self.openAIMessagesForTemplate(json)
+        guard !tmplMessages.isEmpty else {
             respondJSON(
                 fd, ["error": "messages must not be empty"],
                 status: "400 Bad Request", cors: cors)
             return
         }
-        guard let ids = try? engine.encodeChat(msgs, thinking: thinking) else {
-            respondJSON(
-                fd, ["error": "chat template failed"],
-                status: "500 Internal Server Error", cors: cors)
+        let ids: [Int]
+        let visionEmbeds: MLXArray?
+        do {
+            (ids, visionEmbeds) = try engine.encodeWithVision(messages: tmplMessages, tools: nil, thinking: thinking)
+        } catch {
+            respondJSON(fd, ["error": "\(error)"], status: "400 Bad Request", cors: cors)
             return
+        }
+        if visionEmbeds != nil {
+            FileHandle.standardError.write("[vision] \(visionEmbeds!.dim(0)) image tokens spliced\n".data(using: .utf8)!)
         }
         if let e = engine.contextError(promptTokens: ids.count) {
             respondJSON(fd, ["error": e], status: "400 Bad Request", cors: cors)
@@ -753,7 +787,7 @@ public final class Server {
             return alive
         } : nil
         let (text, _, stats) = engine.generate(
-            promptIds: ids, params: params,
+            promptIds: ids, params: params, visionEmbeds: visionEmbeds,
             shouldContinue: { self.peerAlive(fd) }, onToken: callback)
         let final: [String: Any] = [
             "model": engine.modelName, "created_at": iso(Date()),
@@ -906,16 +940,21 @@ public final class Server {
                 status: "400 Bad Request", cors: cors)
             return
         }
-        guard let ids = try? engine.encodeChatOpenAI(messages: tmplMessages, tools: tmplTools, thinking: false) else {
-            respondJSON(
-                fd, ["error": ["message": "template failed"]],
-                status: "500 Internal Server Error", cors: cors)
+        let ids: [Int]
+        let visionEmbeds: MLXArray?
+        do {
+            (ids, visionEmbeds) = try engine.encodeWithVision(messages: tmplMessages, tools: tmplTools, thinking: false)
+        } catch {
+            respondJSON(fd, ["error": ["message": "\(error)"]], status: "400 Bad Request", cors: cors)
             return
         }
         if let e = engine.contextError(promptTokens: ids.count) {
             respondJSON(
                 fd, ["error": ["message": e]], status: "400 Bad Request", cors: cors)
             return
+        }
+        if visionEmbeds != nil {
+            FileHandle.standardError.write("[vision] \(visionEmbeds!.dim(0)) tokens for \(tmplMessages.count) messages\n".data(using: .utf8)!)
         }
         let rid = "chatcmpl-\(UUID().uuidString.prefix(8))"
         if stream, !startChunked(fd, contentType: "text/event-stream", cors: cors) { return }
@@ -932,7 +971,7 @@ public final class Server {
             return alive
         } : nil
         let (rawText, _, stats) = engine.generate(
-            promptIds: ids, params: params,
+            promptIds: ids, params: params, visionEmbeds: visionEmbeds,
             shouldContinue: { self.peerAlive(fd) }, onToken: callback)
         let parsed = Self.parseToolCalls(from: rawText)
         let text: String = parsed.content

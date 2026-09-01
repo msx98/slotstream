@@ -20,6 +20,8 @@ public final class Engine {
     public let tokenizer: any Tokenizers.Tokenizer
     public let eosIds: Set<Int>
     public let modelName: String
+    public private(set) var visionTower: VisionTower?
+    private let visionLock = NSLock()
     /// Longest prompt accepted. Unbounded prompts are not free: KV plus indexer
     /// state costs ~27 KiB per token beyond the announced memory plan, and
     /// prefill runs at tens of tokens a second, so a huge prompt is a long,
@@ -152,25 +154,124 @@ public final class Engine {
             additionalContext: ["enable_thinking": thinking])
     }
 
-    /// OpenAI path: messages already contain tool_calls / tool role etc, and tools
+    /// OpenAI path: messages already contain tool_calls / tool role / image_url etc, and tools
     /// are forwarded to the Jinja template so the model sees the <tools> block.
+    /// Content may be String or [[String:Any]] (vision) — both are forwarded verbatim.
     public func encodeChatOpenAI(
         messages: [[String: Any]], tools: [[String: Any]]?, thinking: Bool = false
     ) throws -> [Int] {
-        // Tokenizer typealiases are [String: any Sendable]; bridging via cast.
+        // Tokenizer typealiases are [String: any Sendable]; need to preserve nested arrays.
+        func toSendable(_ v: Any) -> any Sendable {
+            if let arr = v as? [[String: Any]] {
+                return arr.map { d -> [String: any Sendable] in
+                    var out: [String: any Sendable] = [:]
+                    for (k, vv) in d { out[k] = toSendable(vv) }
+                    return out
+                } as any Sendable
+            }
+            if let d = v as? [String: Any] {
+                var out: [String: any Sendable] = [:]
+                for (k, vv) in d { out[k] = toSendable(vv) }
+                return out as any Sendable
+            }
+            if let a = v as? [Any] {
+                return a.map { toSendable($0) } as any Sendable
+            }
+            return v as any Sendable
+        }
         let msgs: [[String: any Sendable]] = messages.map { dict in
             var m: [String: any Sendable] = [:]
-            for (k, v) in dict { m[k] = v as any Sendable }
+            for (k, v) in dict { m[k] = toSendable(v) }
             return m
         }
         let toolSpecs: [[String: any Sendable]]? = tools?.map { dict in
             var t: [String: any Sendable] = [:]
-            for (k, v) in dict { t[k] = v as any Sendable }
+            for (k, v) in dict { t[k] = toSendable(v) }
             return t
         }
         return try tokenizer.applyChatTemplate(
             messages: msgs, tools: toolSpecs,
             additionalContext: ["enable_thinking": thinking])
+    }
+
+    // MARK: Vision
+
+    public func ensureVisionTower() throws -> VisionTower {
+        visionLock.lock()
+        defer { visionLock.unlock() }
+        if let vt = visionTower { return vt }
+        let idx = try CheckpointIndex(dir: modelDir)
+        let vt = try VisionTower(index: idx)
+        self.visionTower = vt
+        return vt
+    }
+
+    /// Tokenize with vision expansion: single image_pad per image -> N_merged pads.
+    /// Returns expanded ids and concatenated vision embeddings [N, H] (or nil if no images).
+    public func encodeWithVision(messages: [[String: Any]], tools: [[String: Any]]?, thinking: Bool = false) throws -> ([Int], MLXArray?) {
+        let baseIds = try encodeChatOpenAI(messages: messages, tools: tools, thinking: thinking)
+        // Extract image URLs in template order
+        var urls: [String] = []
+        for m in messages {
+            if let content = m["content"] as? [[String: Any]] {
+                for part in content where part["image_url"] != nil || part["image"] != nil || (part["type"] as? String) == "image_url" {
+                    if let iu = part["image_url"] as? [String: Any], let u = iu["url"] as? String { urls.append(u) }
+                    else if let iu = part["image_url"] as? String { urls.append(iu) }
+                    else if let im = part["image"] as? String { urls.append(im) }
+                }
+            }
+            if let images = m["images"] as? [String] {
+                for b64 in images {
+                    let url = b64.hasPrefix("data:") ? b64 : "data:image/jpeg;base64,\(b64)"
+                    urls.append(url)
+                }
+            }
+        }
+        if urls.isEmpty { return (baseIds, nil) }
+        let vt = try ensureVisionTower()
+        var allEmbeds: [MLXArray] = []
+        var nMergedPerImage: [Int] = []
+        for url in urls {
+            let cg = try VisionPreprocess.loadCGImage(from: url)
+            let (emb, _, nMerged, _) = try vt.encodeImage(cg) // emb [1, nMerged, H]
+            allEmbeds.append(emb)
+            nMergedPerImage.append(nMerged)
+        }
+        // Expand baseIds: each single image_pad -> N_merged copies
+        let imageId = model.cfg.imageTokenId
+        var expanded: [Int] = []
+        expanded.reserveCapacity(baseIds.count + nMergedPerImage.reduce(0,+) - urls.count)
+        var imgIdx = 0
+        for tok in baseIds {
+            if tok == imageId, imgIdx < nMergedPerImage.count {
+                let n = nMergedPerImage[imgIdx]
+                expanded.append(contentsOf: Array(repeating: imageId, count: n))
+                imgIdx += 1
+            } else {
+                expanded.append(tok)
+            }
+        }
+        // Concatenate embeddings
+        let total = nMergedPerImage.reduce(0,+)
+        if allEmbeds.isEmpty { return (expanded, nil) }
+        // allEmbeds are [1, n_i, H] -> reshape to [n_i, H] then concat
+        var flats: [MLXArray] = []
+        for emb in allEmbeds {
+            let flat = emb.reshaped([emb.dim(1), model.cfg.hiddenSize])
+            flats.append(flat)
+        }
+        let concat: MLXArray
+        if flats.count == 1 {
+            concat = flats[0]
+        } else {
+            concat = concatenated(flats, axis: 0)
+        }
+        // Validate — mismatch is not silent, throw so client gets 400
+        let placeholderCount = expanded.filter { $0 == imageId }.count
+        if placeholderCount != total {
+            throw VisionError.msg("vision token count mismatch: template has \(placeholderCount) image placeholders but tower produced \(total) tokens (image resized to \(nMergedPerImage))")
+        }
+        return (expanded, concat)
     }
 
     /// Render a template without constructing the multi-GB model. Installer
@@ -216,7 +317,7 @@ public final class Engine {
     /// The invariant the tests hold this to: concatenating every streamed delta
     /// reproduces the non-streamed text exactly.
     public func generate(
-        promptIds: [Int], params: SampleParams,
+        promptIds: [Int], params: SampleParams, visionEmbeds: MLXArray? = nil,
         shouldContinue: (() -> Bool)? = nil,
         onToken: ((Int, String) -> Bool)? = nil
     ) -> (text: String, ids: [Int], stats: GenStats) {
@@ -296,7 +397,7 @@ public final class Engine {
         } : nil
 
         let (ids, stats) = generator.generate(
-            promptIds: promptIds, params: params, eosIds: eosIds, cache: prefixCache,
+            promptIds: promptIds, params: params, eosIds: eosIds, cache: prefixCache, visionEmbeds: visionEmbeds,
             shouldContinue: {
                 guard !clientGone, !stopFound else { return false }
                 return shouldContinue?() ?? true

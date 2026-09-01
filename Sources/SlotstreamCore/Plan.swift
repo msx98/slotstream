@@ -320,7 +320,7 @@ public enum Planner {
     /// pool budget is the ceiling, capped by the context limit above which
     /// reuse is impossible anyway (a match needs `prompt.count > held.count`,
     /// and a prompt that long is already refused).
-    public static func prefixCacheTokensFor(poolBudgetGB: Double, contextCap: Int = 32_768) -> Int {
+    public static func prefixCacheTokensFor(poolBudgetGB: Double, contextCap: Int = 262_144) -> Int {
         let gb = 0.10 * max(0, poolBudgetGB)
         let full = Double(contextCap) * Double(PrefixCache.bytesPerToken) / 1e9
         if gb >= full { return max(0, contextCap) }

@@ -59,6 +59,9 @@ public struct ModelConfig {
     public var ropeTheta: Float = 10_000_000
     public var partialRotaryFactor: Float = 0.25
     public var eosTokenId = 248_044
+    public var imageTokenId = 248_056
+    public var visionStartId = 248_053
+    public var visionEndId = 248_054
     // quantization
     public var qBits = 4
     public var qGroup = 64
@@ -125,6 +128,9 @@ public struct ModelConfig {
         }
         if let e = t["eos_token_id"] as? Int { c.eosTokenId = e }
         if let e = (t["eos_token_id"] as? [Int])?.first { c.eosTokenId = e }
+        if let v = root["image_token_id"] as? Int { c.imageTokenId = v }
+        if let v = root["vision_start_token_id"] as? Int { c.visionStartId = v }
+        if let v = root["vision_end_token_id"] as? Int { c.visionEndId = v }
         // These two values shape a Range and a modulo below. Validate them
         // before using either; malformed custom config used to trap here before
         // the comprehensive validation at the end of the loader could run.
