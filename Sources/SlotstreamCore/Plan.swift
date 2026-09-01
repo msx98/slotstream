@@ -321,7 +321,14 @@ public enum Planner {
     /// reuse is impossible anyway (a match needs `prompt.count > held.count`,
     /// and a prompt that long is already refused).
     public static func prefixCacheTokensFor(poolBudgetGB: Double, contextCap: Int = 262_144) -> Int {
-        let gb = 0.10 * max(0, poolBudgetGB)
+        // Total across 4 conversations, not per-conversation quota — one
+        // long chat may use it all, others LRU. Was 0.10 * poolBudget capped
+        // at 32k; now allows the full --max-context (262k) when budget
+        // permits, otherwise as much as the pool can spare. At 10% a 20 GB
+        // pool only held 72k; at 30% it holds the full 262k (≈7.2 GB + fixed)
+        // when the machine has it, which a 52 GB box does. Still charged
+        // against the budget so expectedPeak stays honest.
+        let gb = 0.30 * max(0, poolBudgetGB)
         let full = Double(contextCap) * Double(PrefixCache.bytesPerToken) / 1e9
         if gb >= full { return max(0, contextCap) }
         let toks = Int(gb * 1e9 / Double(PrefixCache.bytesPerToken))
