@@ -331,17 +331,30 @@ public final class Generator {
                 onToken: onToken, out: &out, generated: &generated,
                 reason: &reason, consumed: &consumed, stats: &stats)
         } else {
+            var lastLog = Date()
             for _ in 0 ..< max(0, params.maxTokens) {
                 if let keepGoing = shouldContinue, !keepGoing() { reason = "stop"; break }
                 let tok = sample(logits, params: params, generated: generated)
                 if eosIds.contains(tok) { reason = "stop"; break }
                 out.append(tok)
                 generated.insert(tok)
+                // Throttled decode progress: every 16 tokens or 1s
+                if out.count == 1 || out.count % 16 == 0 || Date().timeIntervalSince(lastLog) > 1.0 {
+                    let elapsed = -t0.timeIntervalSinceNow
+                    let tps = elapsed > 0 ? Double(out.count) / elapsed : 0
+                    FileHandle.standardError.write(String(format: "decode %d/%d  %.1f tok/s  elapsed %.1fs\n", out.count, params.maxTokens, tps, elapsed).data(using: .utf8)!)
+                    lastLog = Date()
+                }
                 // The callback stops the run for a stop sequence or a gone client.
                 if let cb = onToken, !cb(tok) { reason = "stop"; break }
                 logits = model.lastLogits([tok], state: state)
                 consumed.append(tok)
                 eval(logits)
+            }
+            // Final decode summary if not already logged
+            if out.count > 0 {
+                let elapsed = -t0.timeIntervalSinceNow
+                FileHandle.standardError.write(String(format: "decode done: %d tokens in %.1fs (%.1f tok/s) reason=%@\n", out.count, elapsed, elapsed > 0 ? Double(out.count)/elapsed : 0, reason).data(using: .utf8)!)
             }
         }
         if !isVision { cache?.store(state: state, tokens: consumed) }
