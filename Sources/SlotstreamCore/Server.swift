@@ -115,10 +115,11 @@ public final class Server {
         var headers: [String: String] = [:]
     }
 
-    /// Largest request body accepted. Prompts are text; anything past this is
-    /// a mistake or an attack, and reading it unbounded is how a local process
-    /// gets OOM-killed.
-    static let maxBodyBytes = 4 << 20
+    /// Largest request body accepted. Text prompts are tiny, but vision inputs
+/// (base64-encoded images) commonly reach several MB and must be served. The
+/// cap still exists to keep the read bounded against an unbounded attacker;
+/// requests past it get a 413 instead of being silently dropped.
+    static let maxBodyBytes = 32 << 20
 
     private func readRequest(_ fd: Int32) -> Request? {
         var buf = Data()
@@ -150,13 +151,20 @@ public final class Server {
                 if key == "content-length" { contentLength = Int(value) ?? -1 }
             }
         }
-        if contentLength < 0 || contentLength > Self.maxBodyBytes { return nil }
+        if contentLength < 0 { return nil }
+        if contentLength > Self.maxBodyBytes {
+            respond413(fd, contentLength, cors: Self.corsHeaders(origin: req.headers["origin"]) ?? "")
+            return nil
+        }
         var body = Data(buf[headerEnd!.upperBound...].prefix(contentLength))
         while body.count < contentLength {
             let n = read(fd, &tmp, min(tmp.count, contentLength - body.count))
             if n <= 0 { break }
             body.append(contentsOf: tmp[0 ..< n])
-            if body.count > Self.maxBodyBytes { return nil }
+            if body.count > Self.maxBodyBytes {
+                respond413(fd, contentLength, cors: Self.corsHeaders(origin: req.headers["origin"]) ?? "")
+                return nil
+            }
         }
         guard body.count == contentLength else { return nil }
         req.body = body
@@ -193,6 +201,13 @@ public final class Server {
     ) {
         let body = (try? JSONSerialization.data(withJSONObject: obj)) ?? Data("{}".utf8)
         var head = "HTTP/1.1 \(status)\r\nContent-Type: application/json\r\n" + cors
+        head += "Content-Length: \(body.count)\r\nConnection: close\r\n\r\n"
+        _ = send(fd, Data(head.utf8) + body)
+    }
+
+    private func respond413(_ fd: Int32, _ length: Int, cors: String) {
+        let body = Data("{\"error\":\"payload too large\",\"limit_bytes\":\(Self.maxBodyBytes),\"received_bytes\":\(length)}\n".utf8)
+        var head = "HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/json\r\n" + cors
         head += "Content-Length: \(body.count)\r\nConnection: close\r\n\r\n"
         _ = send(fd, Data(head.utf8) + body)
     }
@@ -1429,7 +1444,9 @@ public final class Server {
                 // raw XML isn't emitted as a content delta in addition to the
                 // parsed tool_calls deltas (which is what OpenCode users see
                 // as "the tool call appearing twice, in the raw text").
-                let afterIdx = streamBuf.index(after: r.upperBound)
+                let afterIdx = r.upperBound == streamBuf.endIndex
+                    ? streamBuf.endIndex
+                    : streamBuf.index(after: r.upperBound)
                 let tail = cleanContentTail(streamBuf, after: afterIdx, toolCloseRegex: toolCloseRegex)
                 if tail.count > contentSent {
                     let toSend = String(tail.dropFirst(contentSent))
