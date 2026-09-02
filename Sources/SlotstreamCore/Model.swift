@@ -51,6 +51,58 @@ public final class Qwen4ExpModel {
             }
             return out
         }
+
+        /// Dtype of each linear-cache array, for diagnosing save/load round trips.
+        public func linearDtypes() -> [String: String] {
+            func name(_ d: DType?) -> String {
+                guard let d = d else { return "nil" }
+                switch d {
+                case .float32: return "float32"
+                case .bfloat16: return "bfloat16"
+                case .float16: return "float16"
+                default: return "other"
+                }
+            }
+            var out: [String: String] = [:]
+            for (l, c) in linear {
+                out["conv_\(l)"] = name(c.convState?.dtype)
+                out["ssm_\(l)"] = name(c.ssmState?.dtype)
+                out["pleConv_\(l)"] = name(c.pleConvState?.dtype)
+            }
+            return out
+        }
+
+        /// Test-only: copy linear-cache array references from `other`, plus
+        /// the n-gram context and token count. Used to build a state that's
+        /// a known-faithful copy of a live one without going through disk,
+        /// for isolating save/load bugs.
+        public func copyForTest(from other: Qwen4ExpModel.State) {
+            for l in linear.keys {
+                if let o = other.linear[l] {
+                    linear[l]?.convState = o.convState
+                    linear[l]?.ssmState = o.ssmState
+                    linear[l]?.pleConvState = o.pleConvState
+                    linear[l]?.ngramCtx = o.ngramCtx
+                }
+            }
+            ngramCtx = other.ngramCtx
+            tokenCount = other.tokenCount
+        }
+
+        /// Test-only: dump the strides of each linear cache array so we can
+        /// check whether the live (kernel-output) arrays and the disk-loaded
+        /// arrays are laid out the same way. The GDN Metal kernel computes
+        /// buffer offsets by hand and assumes a contiguous row-major layout,
+        /// so a stride mismatch would be invisible to `.asArray` but fatal.
+        public func linearStrides() -> [String: [Int]] {
+            var out: [String: [Int]] = [:]
+            for (l, c) in linear {
+                out["conv_\(l)"] = c.convState?.strides ?? []
+                out["ssm_\(l)"] = c.ssmState?.strides ?? []
+                out["pleConv_\(l)"] = c.pleConvState?.strides ?? []
+            }
+            return out
+        }
     }
 
     public init(index: CheckpointIndex, poolSlots: Int, runLayers: Int? = nil) throws {

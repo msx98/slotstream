@@ -161,7 +161,18 @@ public enum DiskCache {
                     let f32 = a.asType(.float32)
                     let shape = f32.shape
                     let arrData = f32.asArray(Float.self)
-                    let header: [String: Any] = ["name": name, "shape": shape, "dtype": "float32"]
+                    // liveDtype records what the running model held: the
+                    // GDN SSM state is float32 by design (bf16 loses
+                    // precision across the recurrence), everything else is
+                    // bfloat16. Restoring ssm to bf16 corrupts it.
+                    let live: String
+                    switch a.dtype {
+                    case .float32: live = "float32"
+                    case .float16: live = "float16"
+                    default: live = "bfloat16"
+                    }
+                    let header: [String: Any] = [
+                        "name": name, "shape": shape, "dtype": "float32", "liveDtype": live]
                     let headerData = try JSONSerialization.data(withJSONObject: header, options: [])
                     var len = UInt32(headerData.count).littleEndian
                     var combined = Data()
@@ -316,7 +327,7 @@ public enum DiskCache {
             log("load: bad version \(meta["version"] ?? -1) for key=\(key.prefix(12))")
             return nil
         }
-        var body = data[(nlIndex + 1)...]
+        var body = data.subdata(in: (nlIndex + 1)..<data.count)
 
         // Restore scalar fields.
         let state = template
@@ -324,25 +335,39 @@ public enum DiskCache {
         else if let ngram = meta["ngramCtx"] as? [Int] { state.ngramCtx = ngram.map { Int64($0) } }
         if let tc = meta["tokenCount"] as? Int { state.tokenCount = tc }
 
-        // Read the whole body once into a name -> MLXArray map. Doing it in
-        // a single pass avoids name-order brittleness across the layout.
+        // Read the body one array at a time. `body` is re-based to index 0
+        // so the offsets below are correct. Each array on disk is
+        // `<len:u32-le><header:len bytes of JSON><floats:shape-product*4 bytes>`,
+        // and the float byte count is derived from the parsed shape so we
+        // never consume into the next array's header.
         var arraysByName: [String: MLXArray] = [:]
         while body.count >= 4 {
-            let len = body[body.startIndex..<body.startIndex+4]
+            let len = body[0..<4]
                 .withUnsafeBytes { $0.load(as: UInt32.self).littleEndian }
-            let hEnd = body.startIndex + 4 + Int(len)
-            guard body.count >= hEnd else { break }
-            let headerData = body[(body.startIndex + 4)..<hEnd]
+            let headerSize = 4 + Int(len)
+            guard body.count >= headerSize else { break }
+            let headerData = body[4..<headerSize]
             guard let header = try? JSONSerialization.jsonObject(with: headerData) as? [String: Any],
                   let name = header["name"] as? String,
                   let shape = header["shape"] as? [Int]
             else { break }
-            let floatsBytes = body.count - hEnd
-            guard floatsBytes % 4 == 0 else { break }
-            let raw = body[hEnd..<(hEnd + floatsBytes)]
-            body = body[(hEnd + floatsBytes)...]
+            let elementCount = shape.reduce(1, *)
+            let dataBytes = elementCount * 4
+            guard body.count >= headerSize + dataBytes else { break }
+            let raw = body[headerSize..<(headerSize + dataBytes)]
+            body = body.subdata(in: (headerSize + dataBytes)..<body.count)
             let floats = raw.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
-            arraysByName[name] = MLXArray(floats, shape).asType(.bfloat16)
+            // Restore to the dtype the live model held (liveDtype, added in
+            // v3 headers): the SSM state must come back as float32 or the
+            // recurrence diverges. Older headers without the field restore
+            // as bfloat16, which only the bf16 arrays did hold.
+            let dt: DType
+            switch header["liveDtype"] as? String {
+            case "float32": dt = .float32
+            case "float16": dt = .float16
+            default: dt = .bfloat16
+            }
+            arraysByName[name] = MLXArray(floats, shape).asType(dt)
         }
 
         for l in template.linear.keys {

@@ -1591,6 +1591,9 @@ struct KVRoundtripCheck: ParsableCommand {
                 let cliState = m.makeState()
                 var i = 0
                 var cliMulti: [Float] = []
+                var cliBoundary: [String: [Float]] = [:]
+                var cliBoundaryStrides: [String: [Int]] = [:]
+                var cliBoundaryState: Qwen4ExpModel.State? = nil
                 while i < N {
                     let hi = min(i + C, N)
                     let chunkIds = Array(ids[i..<hi])
@@ -1631,10 +1634,26 @@ struct KVRoundtripCheck: ParsableCommand {
                             parentSha = ChunkIndex.makeKey(parentSha: parentSha, embeddings: e2)
                         }
                         let key = ChunkIndex.makeKey(parentSha: parentSha, embeddings: chunkEmbeds)
+                        FileHandle.standardError.write(
+                            ("  debug  SAVE  depth=\(depth) tokens[\(0)..<\(hi)] count=\(hi) "
+                             + "dir=\(key) parent=\(parentSha ?? "nil")\n").data(using: .utf8)!)
                         DiskCache.saveAsync(
                             state: cliState, tokenIds: Array(ids[0..<hi]),
                             key: key, parentSha: parentSha, depth: depth,
                             embeddings: chunkEmbeds)
+                        // Snapshot the live state at this boundary so the load
+                        // step can diff the restored arrays against it BEFORE
+                        // the last chunk runs.
+                        cliBoundary = cliState.linearDebug()
+                        cliBoundaryStrides = cliState.linearStrides()
+                        // Build a ref-copy state of cliState (no disk). If a
+                        // ref-copied state + chunk 4 matches cliState's
+                        // chunk 4, the divergence is the disk round trip.
+                        if depth == 3 {
+                            let copy = m.makeState()
+                            copy.copyForTest(from: cliState)
+                            cliBoundaryState = copy
+                        }
                     }
                     i = hi
                 }
@@ -1678,6 +1697,18 @@ struct KVRoundtripCheck: ParsableCommand {
                     return
                 }
                 let depth = hitLen / C
+                // Recompute the key loadState will resolve, so the test log can
+                // show which file is loaded and what its parent chain is.
+                var loadParent: String? = nil
+                for d in 0..<(depth - 1) {
+                    if let e = embed(d) { loadParent = ChunkIndex.makeKey(parentSha: loadParent, embeddings: e) }
+                }
+                let loadKey = ChunkIndex.makeKey(
+                    parentSha: loadParent,
+                    embeddings: embed(depth - 1) ?? [])
+                FileHandle.standardError.write(
+                    ("  debug  LOAD  depth=\(depth) tokens[0..<\(hitLen)] count=\(hitLen) "
+                     + "dir=\(loadKey) parent=\(loadParent ?? "nil")\n").data(using: .utf8)!)
                 guard let restored = DiskCache.loadState(
                     for: embed, depth: depth, tokenIds: Array(ids[0..<hitLen]),
                     template: m.makeState())
@@ -1688,6 +1719,45 @@ struct KVRoundtripCheck: ParsableCommand {
                     sem.signal()
                     return
                 }
+                // Fidelity gate: the restored arrays must equal the live
+                // arrays captured at the 48-token save boundary, BEFORE any
+                // new computation. A diff here is a save/load bug. We
+                // compare values AND strides/dtype because the GDN Metal
+                // kernel computes buffer offsets by hand and assumes a
+                // contiguous row-major layout — a stride mismatch is
+                // invisible to `.asArray` but fatal.
+                let resBoundary = restored.linearDebug()
+                let resBoundaryStrides = restored.linearStrides()
+                let resBoundaryDTypes = restored.linearDtypes()
+                let cliBoundaryDTypes = cliState.linearDtypes()
+                for key in ["conv_0", "conv_1", "ssm_0", "ssm_1", "pleConv_1"] {
+                    let a = cliBoundary[key] ?? []
+                    let b = resBoundary[key] ?? []
+                    var maxDiff: Float = 0
+                    for (x, y) in zip(a, b) { maxDiff = max(maxDiff, abs(x - y)) }
+                    let liveStr = cliBoundaryStrides[key] ?? []
+                    let loadStr = resBoundaryStrides[key] ?? []
+                    FileHandle.standardError.write(String(
+                        format: "  debug  BOUNDARY %@ maxDiff=%.6g  dtype cli=%@ res=%@  strides live=%@ res=%@\n",
+                        key, maxDiff,
+                        cliBoundaryDTypes[key] ?? "?", resBoundaryDTypes[key] ?? "?",
+                        "\(liveStr)", "\(loadStr)").data(using: .utf8)!)
+                }
+
+                // If a ref-copied state + chunk 4 matches cliState's chunk
+                // 4, the divergence is the disk round trip. If it doesn't
+                // match either, the bug lives in something the State object
+                // carries that the linear arrays don't.
+                var memRefDiff: Float = 0
+                if let memState = cliBoundaryState {
+                    let (_, memLast) = m.hiddenStatesWithMulti(
+                        Array(ids[hitLen..<N]), state: memState)
+                    let memMulti = vec(memLast)
+                    for (x, y) in zip(cliMulti, memMulti) { memRefDiff = max(memRefDiff, abs(x - y)) }
+                }
+                FileHandle.standardError.write(String(
+                    format: "  debug  REF-COPY state + last chunk vs cli: maxDiff=%.6g\n",
+                    memRefDiff).data(using: .utf8)!)
                 // Finish prefill for the last chunk so the multi stream is
                 // comparable to the one-pass and chunked builds.
                 let (_, restoredLast) = m.hiddenStatesWithMulti(
@@ -1701,14 +1771,16 @@ struct KVRoundtripCheck: ParsableCommand {
                     "  debug  cliState.tokenCount=\(cliState.tokenCount)\n".data(using: .utf8)!)
                 let cliDebug = cliState.linearDebug()
                 let resDebug = restored.linearDebug()
+                let cliDtype = cliState.linearDtypes()
+                let resDtype = restored.linearDtypes()
                 for key in ["conv_0", "conv_1", "ssm_0", "ssm_1", "pleConv_1"] {
                     let a = cliDebug[key] ?? []
                     let b = resDebug[key] ?? []
                     var maxDiff: Float = 0
                     for (x, y) in zip(a, b) { maxDiff = max(maxDiff, abs(x - y)) }
                     FileHandle.standardError.write(String(
-                        format: "  debug  %@ cli count=%d res count=%d maxDiff=%.6g\n",
-                        key, a.count, b.count, maxDiff).data(using: .utf8)!)
+                        format: "  debug  %@ cli count=%d res count=%d maxDiff=%.6g  dtype cli=%@ res=%@\n",
+                        key, a.count, b.count, maxDiff, cliDtype[key] ?? "?", resDtype[key] ?? "?").data(using: .utf8)!)
                 }
                 FileHandle.standardError.write(
                     "  debug  cliState.tokenCount=\(cliState.tokenCount)\n".data(using: .utf8)!)
