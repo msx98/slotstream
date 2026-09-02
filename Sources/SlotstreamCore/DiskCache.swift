@@ -1,5 +1,6 @@
 // Disk-persisted chunk KV cache: saves prefix states after each prefill chunk
-// and reloads them to skip recomputation. Layout:
+// plus the variable-length endpoint after decode, and reloads them to skip
+// recomputation. Layout:
 //   ~/.slotstream/kvcache/
 //     metadata.db                 SQLite index (parent chains, last_used, sizes)
 //     <key>/
@@ -94,7 +95,8 @@ public enum DiskCache {
 
     // MARK: - save
 
-    /// Save the chunk that ends at `tokens` (a multiple of `chunk`). The
+    /// Save the node that ends at `tokens`. Prefill nodes normally end on the
+    /// configured chunk boundary; post-decode terminal nodes need not. The
     /// key is computed synchronously by the caller so the next chunk's
     /// parent_sha can be derived without waiting for the IO. The actual
     /// write runs on the serial save queue; if the same key is queued twice
@@ -135,6 +137,7 @@ public enum DiskCache {
                     } else {
                         ChunkIndex.shared.register(
                             key: key, parentSha: parentSha, depth: depth,
+                            parentTokenCount: parentTokenCount, tokenCount: tokenCount,
                             sizeBytes: directorySize(at: base))
                     }
                     let reconciliation = wasIndexed ? "" : "; restored missing index row"
@@ -260,7 +263,9 @@ public enum DiskCache {
                 // rebuild.
                 let dirSize = directorySize(at: base)
                 ChunkIndex.shared.register(
-                    key: key, parentSha: parentSha, depth: depth, sizeBytes: dirSize)
+                    key: key, parentSha: parentSha, depth: depth,
+                    parentTokenCount: parentTokenCount, tokenCount: tokenCount,
+                    sizeBytes: dirSize)
 
                 // Eviction: if over quota, drop leaves until under quota.
                 let total = ChunkIndex.shared.totalBytes()
@@ -329,6 +334,7 @@ public enum DiskCache {
                 // make lookup use the same source of truth and heal the index.
                 ChunkIndex.shared.register(
                     key: key, parentSha: parentSha, depth: depth + 1,
+                    parentTokenCount: depth * chunk, tokenCount: (depth + 1) * chunk,
                     sizeBytes: directorySize(at: base))
                 log("lookup recovered: depth=\(depth + 1) key=\(key.prefix(12)) data.kv existed but index row was missing")
                 parentSha = key
@@ -364,11 +370,12 @@ public enum DiskCache {
 
     // MARK: - load
 
-    /// Rebuild a state by applying fixed-size nodes from the chain root through
-    /// `depth`. Depth is the one-based number of consumed chunks.
+    /// Rebuild a state by applying `depth` fixed-size nodes and, when present,
+    /// one variable-length terminal child.
     public static func loadState(
         for embed: (Int) -> [Float]?,
         depth: Int,
+        terminalKey: String? = nil,
         tokenIds: [Int],
         template: Qwen4ExpModel.State,
         model: String = "qwen38"
@@ -377,7 +384,7 @@ public enum DiskCache {
             log("load skipped: disk cache disabled")
             return nil
         }
-        guard depth > 0 else {
+        guard depth > 0 || terminalKey != nil else {
             log("load failed: invalid chain depth \(depth)")
             return nil
         }
@@ -392,6 +399,7 @@ public enum DiskCache {
             keys.append(key)
             parentSha = key
         }
+        if let terminalKey { keys.append(terminalKey) }
 
         let state = template
         for (index, key) in keys.enumerated() {
@@ -401,7 +409,7 @@ public enum DiskCache {
             log("load failed: chain restored \(state.tokenCount) tokens, expected \(tokenIds.count)")
             return nil
         }
-        log("load done: \(tokenIds.count) tokens depth=\(depth) key=\(keys.last!.prefix(12)) from \(depth) nodes")
+        log("load done: \(tokenIds.count) tokens depth=\(depth) key=\(keys.last!.prefix(12)) from \(keys.count) nodes")
         return state
     }
 

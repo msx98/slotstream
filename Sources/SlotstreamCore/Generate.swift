@@ -284,6 +284,8 @@ public final class Generator {
         // Disk cache: try longest chunk-aligned prefix on disk before falling back to RAM cache
         var diskState: Qwen4ExpModel.State? = nil
         var diskHitLen: Int? = nil
+        var diskParentKey: String? = nil
+        var diskParentTokenCount = 0
         if !isVision {
             // Embedding extractor: pull the embedding rows for chunk `d`
             // (tokens [d*prefillChunk, (d+1)*prefillChunk)) on demand. The
@@ -293,23 +295,71 @@ public final class Generator {
             let pc = prefillChunk
             let embed: (Int) -> [Float]? = { d in
                 let lo = d * pc
-                let hi = min(lo + pc, promptIds.count)
-                guard lo < promptIds.count else { return nil }
+                let hi = lo + pc
+                guard hi <= promptIds.count else { return nil }
                 let ids = MLXArray(promptIds[lo..<hi].map { Int32($0) }, [1, hi - lo])
                 let rows = m.resident.embed(ids).asType(.float32)
                 eval(rows)
                 return rows.reshaped([rows.dim(1) * rows.dim(2)]).asArray(Float.self)
             }
             if let l = DiskCache.longestPrefixHit(chunk: prefillChunk, embed: embed) {
-                let depth = l / prefillChunk
-                let curReused = hit?.reused ?? 0
-                if l > curReused, let ds = DiskCache.loadState(
-                    for: embed, depth: depth, tokenIds: Array(promptIds[0..<l]),
-                    template: model.makeState())
+                for d in 0..<(l / pc) {
+                    guard let embeddings = embed(d) else { break }
+                    diskParentKey = ChunkIndex.makeKey(
+                        parentSha: diskParentKey, embeddings: embeddings)
+                }
+                diskParentTokenCount = l
+            }
+
+            // A decoded conversation endpoint is a variable-length child of
+            // the deepest fixed boundary. Test the longest possible endpoint
+            // first, and only accept one whose content-derived key matches.
+            var terminalKey: String? = nil
+            var terminalLen: Int? = nil
+            for candidate in ChunkIndex.shared.childEndpoints(
+                parentSha: diskParentKey, parentTokenCount: diskParentTokenCount,
+                before: promptIds.count)
+            {
+                let lo = diskParentTokenCount
+                let hi = candidate.tokenCount
+                let ids = MLXArray(promptIds[lo..<hi].map { Int32($0) }, [1, hi - lo])
+                let rows = m.resident.embed(ids).asType(.float32)
+                eval(rows)
+                let embeddings = rows.reshaped([rows.dim(1) * rows.dim(2)]).asArray(Float.self)
+                if ChunkIndex.makeKey(
+                    parentSha: diskParentKey, embeddings: embeddings) == candidate.key
                 {
-                    diskState = ds
-                    diskHitLen = l
-                    FileHandle.standardError.write("kvcache disk hit: \(l)/\(promptIds.count) tokens\n".data(using: .utf8)!)
+                    terminalKey = candidate.key
+                    terminalLen = hi
+                    break
+                }
+            }
+
+            let fixedLen = diskParentTokenCount
+            let loadLen = terminalLen ?? fixedLen
+            if loadLen > 0 {
+                let depth = fixedLen / pc
+                let curReused = hit?.reused ?? 0
+                if loadLen > curReused {
+                    var usedLen = loadLen
+                    var ds = DiskCache.loadState(
+                        for: embed, depth: depth, terminalKey: terminalKey,
+                        tokenIds: Array(promptIds[0..<loadLen]),
+                        template: model.makeState())
+                    // A stale or corrupt terminal must not hide a valid fixed
+                    // parent that was already proven by the chain walk.
+                    if ds == nil, terminalKey != nil, fixedLen > curReused {
+                        usedLen = fixedLen
+                        ds = DiskCache.loadState(
+                            for: embed, depth: depth,
+                            tokenIds: Array(promptIds[0..<fixedLen]),
+                            template: model.makeState())
+                    }
+                    if let ds {
+                        diskState = ds
+                        diskHitLen = usedLen
+                        FileHandle.standardError.write("kvcache disk hit: \(usedLen)/\(promptIds.count) tokens\n".data(using: .utf8)!)
+                    }
                 }
             }
         }
@@ -443,6 +493,8 @@ public final class Generator {
                     state: state, tokenIds: Array(promptIds[0..<hi]),
                     key: key, parentSha: parentSha, depth: depth,
                     embeddings: chunkEmbeds, parentTokenCount: chunkLo)
+                diskParentKey = key
+                diskParentTokenCount = hi
             }
             i = hi
         }
@@ -496,11 +548,41 @@ public final class Generator {
                 FileHandle.standardError.write(String(format: "decode done: %d tokens in %.1fs (%.1f tok/s) reason=%@\n", out.count, elapsed, elapsed > 0 ? Double(out.count)/elapsed : 0, reason).data(using: .utf8)!)
             }
         }
-        if !isVision { cache?.store(state: state, tokens: consumed) }
+        if !isVision {
+            cache?.store(state: state, tokens: consumed)
+            // Conversation endpoints are rarely aligned to the prefill pass
+            // size. Save the terminal delta from the deepest fixed boundary.
+            if DiskCache.enabled, consumed.count > diskParentTokenCount {
+                let lo = diskParentTokenCount
+                let hi = consumed.count
+                let ids = MLXArray(consumed[lo..<hi].map { Int32($0) }, [1, hi - lo])
+                let rows = model.resident.embed(ids).asType(.float32)
+                eval(rows)
+                let embeddings = rows.reshaped([rows.dim(1) * rows.dim(2)]).asArray(Float.self)
+                let key = ChunkIndex.makeKey(
+                    parentSha: diskParentKey, embeddings: embeddings)
+                DiskCache.saveAsync(
+                    state: state, tokenIds: consumed, key: key,
+                    parentSha: diskParentKey,
+                    depth: diskParentTokenCount / prefillChunk + 1,
+                    embeddings: embeddings,
+                    parentTokenCount: diskParentTokenCount)
+            }
+        }
         stats.finishReason = reason
         stats.decodeTokens = out.count
         stats.decodeSeconds = -t0.timeIntervalSinceNow
         stats.expertHitRate = model.pool.hitRate
+        let expertLookups = model.pool.hits + model.pool.misses
+        if expertLookups > 0 {
+            let residentPct = 100.0 * Double(model.pool.hits) / Double(expertLookups)
+            let prefetchPct = 100.0 * Double(model.pool.prefetchPromotions) / Double(expertLookups)
+            FileHandle.standardError.write(String(
+                format: "decode experts: %.1f%% resident (%d/%d), %.1f%% prefetched (%d), %d demand loads\n",
+                residentPct, model.pool.hits, expertLookups, prefetchPct,
+                model.pool.prefetchPromotions, model.pool.recordsFetched
+            ).data(using: .utf8)!)
+        }
         stats.ngramRowHits = model.ngram.rowHits
         stats.ngramRowMisses = model.ngram.rowMisses
         stats.mlxPeakMemoryGB = Double(MLX.Memory.peakMemory) / 1e9

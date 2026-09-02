@@ -1,11 +1,12 @@
 // Chunk index for the disk-persisted prefix KV cache.
 //
 // One node = one chunk's append-only attention state plus the recurrent state
-// at that `prefillChunk` boundary (default 4096 tokens). Nodes are chained by
+// at its endpoint. Prefill nodes normally end at `prefillChunk` boundaries;
+// terminal decode nodes may have any positive length. Nodes are chained by
 // parent: chunk N's key is
 // `sha256(parent_sha || sha256(chunk_embeddings))`, so two conversations
-// that share the first 4096 tokens but diverge at position 4097 get two
-// distinct keys at depth 1 and never alias.
+// that share a parent but diverge in the next token range get distinct keys
+// and never alias.
 //
 // On disk, each chunk lives at `kvcache_dir/<key>/` with three files:
 //   - `data.kv` — the chunk delta plus endpoint recurrent state
@@ -61,6 +62,8 @@ public final class ChunkIndex {
           key TEXT PRIMARY KEY,
           parent_sha TEXT,
           depth INTEGER NOT NULL,
+          parent_token_count INTEGER,
+          token_count INTEGER,
           size_bytes INTEGER NOT NULL,
           last_used REAL NOT NULL
         );
@@ -78,6 +81,14 @@ public final class ChunkIndex {
             FileHandle.standardError.write(
                 Data("[kvcache] schema init failed: \(String(cString: sqlite3_errmsg(db)))\n".utf8))
         }
+        // Existing v4 indexes predate variable-length terminal nodes. Nullable
+        // columns keep those rows readable while new saves populate boundaries.
+        sqlite3_exec(db, "ALTER TABLE chunks ADD COLUMN parent_token_count INTEGER;", nil, nil, nil)
+        sqlite3_exec(db, "ALTER TABLE chunks ADD COLUMN token_count INTEGER;", nil, nil, nil)
+        sqlite3_exec(
+            db,
+            "CREATE INDEX IF NOT EXISTS chunks_boundary ON chunks(parent_sha, parent_token_count, token_count);",
+            nil, nil, nil)
     }
 
     deinit { if db != nil { sqlite3_close(db) } }
@@ -130,15 +141,20 @@ public func chainLength(
     /// Record a freshly saved chunk. Returns the resolved key (caller needs
     /// it to write the parent_sha.bin and emb_sha.bin files).
     public func register(
-        key: String, parentSha: String?, depth: Int, sizeBytes: Int
+        key: String, parentSha: String?, depth: Int,
+        parentTokenCount: Int, tokenCount: Int, sizeBytes: Int
     ) {
         serial.sync {
             let stmt = prepare("""
-            INSERT INTO chunks(key, parent_sha, depth, size_bytes, last_used)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO chunks(
+              key, parent_sha, depth, parent_token_count, token_count,
+              size_bytes, last_used)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(key) DO UPDATE SET
               parent_sha=excluded.parent_sha,
               depth=excluded.depth,
+              parent_token_count=excluded.parent_token_count,
+              token_count=excluded.token_count,
               size_bytes=excluded.size_bytes,
               last_used=excluded.last_used;
             """)
@@ -151,8 +167,10 @@ public func chainLength(
                 sqlite3_bind_null(stmt, 2)
             }
             sqlite3_bind_int(stmt, 3, Int32(depth))
-            sqlite3_bind_int64(stmt, 4, Int64(sizeBytes))
-            sqlite3_bind_double(stmt, 5, now)
+            sqlite3_bind_int64(stmt, 4, Int64(parentTokenCount))
+            sqlite3_bind_int64(stmt, 5, Int64(tokenCount))
+            sqlite3_bind_int64(stmt, 6, Int64(sizeBytes))
+            sqlite3_bind_double(stmt, 7, now)
             if sqlite3_step(stmt) != SQLITE_DONE {
                 FileHandle.standardError.write(
                     Data("[kvcache] register failed for \(key.prefix(12)): \(String(cString: sqlite3_errmsg(db)))\n".utf8))
@@ -172,6 +190,38 @@ public func chainLength(
             defer { sqlite3_finalize(stmt) }
             sqlite3_bind_text(stmt, 1, key, -1, SQLITE_TRANSIENT)
             return sqlite3_step(stmt) == SQLITE_ROW
+        }
+    }
+
+    /// Possible variable-length children rooted at a known state boundary.
+    /// The caller validates content by deriving each key from prompt embeddings.
+    public func childEndpoints(
+        parentSha: String?, parentTokenCount: Int, before tokenCount: Int
+    ) -> [(key: String, tokenCount: Int)] {
+        serial.sync {
+            let parentClause = parentSha == nil ? "parent_sha IS NULL" : "parent_sha = ?"
+            let stmt = prepare("""
+            SELECT key, token_count FROM chunks
+            WHERE \(parentClause)
+              AND parent_token_count = ?
+              AND token_count > parent_token_count
+              AND token_count < ?
+            ORDER BY token_count DESC;
+            """)
+            defer { sqlite3_finalize(stmt) }
+            var bind: Int32 = 1
+            if let parentSha {
+                sqlite3_bind_text(stmt, bind, parentSha, -1, SQLITE_TRANSIENT)
+                bind += 1
+            }
+            sqlite3_bind_int64(stmt, bind, Int64(parentTokenCount))
+            sqlite3_bind_int64(stmt, bind + 1, Int64(tokenCount))
+            var result: [(String, Int)] = []
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                guard let key = sqlite3_column_text(stmt, 0) else { continue }
+                result.append((String(cString: key), Int(sqlite3_column_int64(stmt, 1))))
+            }
+            return result
         }
     }
 

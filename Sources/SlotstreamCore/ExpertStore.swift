@@ -14,6 +14,26 @@ public struct ExpertKey: Hashable {
     }
 }
 
+private final class StagedExpertRecord {
+    fileprivate var pieces: [UnsafeMutableRawPointer?]
+
+    init(pieceBytes: [Int]) {
+        pieces = []
+        for bytes in pieceBytes {
+            var pointer: UnsafeMutableRawPointer? = nil
+            guard posix_memalign(&pointer, 16384, bytes) == 0, let pointer else {
+                for case let allocated? in pieces { free(allocated) }
+                fatalError("out of memory staging prefetched expert record")
+            }
+            pieces.append(pointer)
+        }
+    }
+
+    deinit {
+        for case let pointer? in pieces { free(pointer) }
+    }
+}
+
 public final class ExpertStore {
     public let index: CheckpointIndex
     private let cfg: ModelConfig
@@ -156,9 +176,160 @@ public final class ExpertStore {
         eval(out)
         return out
     }
+
+    /// CPU-only prefetch path. Ownership stays in one record per ring slot;
+    /// MLX arrays are created later on the decode thread when a record is used.
+    fileprivate func readRecords(
+        _ keys: [ExpertKey], queueDepth: Int = ExpertStore.defaultQueueDepth
+    ) -> [StagedExpertRecord] {
+        let records = keys.map { _ in StagedExpertRecord(pieceBytes: pieceRowBytes) }
+        let jobs = (0 ..< keys.count).flatMap { record in
+            (0 ..< Self.pieces.count).map { (record: record, piece: $0) }
+        }
+        let lanes = min(max(queueDepth, 1), jobs.count)
+        DispatchQueue.concurrentPerform(iterations: lanes) { lane in
+            var j = lane
+            while j < jobs.count {
+                let job = jobs[j]
+                let key = keys[job.record]
+                let ref = refs[key.layer][job.piece]
+                let bytes = pieceRowBytes[job.piece]
+                index.pread(
+                    into: records[job.record].pieces[job.piece]!, ref,
+                    offset: key.expert * bytes, count: bytes)
+                j += lanes
+            }
+        }
+        return records
+    }
+
+    fileprivate func materialize(_ record: StagedExpertRecord) -> [MLXArray] {
+        refs[0].indices.map { piece in
+            let ref = refs[0][piece]
+            let dtype: DType = ref.dtype == "U32" ? .uint32 : .bfloat16
+            let pointer = record.pieces[piece]!
+            record.pieces[piece] = nil
+            return MLXArray(
+                rawPointer: pointer, [1] + Array(ref.shape.dropFirst()), dtype: dtype
+            ) { free(pointer) }
+        }
+    }
 }
 
 // MARK: - Slot pool
+
+/// Fixed-size speculative staging. A generation on each ring slot is the CPU
+/// fence: demand waits only for a matching in-flight record, and a late worker
+/// can never publish into a slot that has since rotated to another key.
+private final class ExpertPrefetchRing {
+    private struct Entry {
+        var key: ExpertKey?
+        var generation = 0
+        var loading = false
+        var record: StagedExpertRecord?
+    }
+
+    private let store: ExpertStore
+    private let queue = DispatchQueue(label: "slotstream.expert-prefetch", qos: .userInitiated)
+    private let fence = NSCondition()
+    private var entries: [Entry]
+    private var cursor = 0
+
+    init(capacity: Int, store: ExpertStore) {
+        self.store = store
+        entries = Array(repeating: Entry(), count: capacity)
+    }
+
+    var capacity: Int { entries.count }
+
+    func reconcile(_ desired: [ExpertKey]) {
+        guard !entries.isEmpty else { return }
+        let desiredSet = Set(desired)
+        var work: [(slot: Int, generation: Int, key: ExpertKey)] = []
+        fence.lock()
+        let present = Set(entries.compactMap { entry -> ExpertKey? in
+            guard let key = entry.key, desiredSet.contains(key) else { return nil }
+            return key
+        })
+        for key in desired where !present.contains(key) {
+            var selected: Int?
+            for _ in 0 ..< entries.count {
+                let slot = cursor
+                cursor = (cursor + 1) % entries.count
+                let entry = entries[slot]
+                if !entry.loading && (entry.key == nil || !desiredSet.contains(entry.key!)) {
+                    selected = slot
+                    break
+                }
+            }
+            guard let slot = selected else { break }
+            entries[slot].generation += 1
+            entries[slot].key = key
+            entries[slot].loading = true
+            entries[slot].record = nil
+            work.append((slot, entries[slot].generation, key))
+        }
+        fence.unlock()
+
+        for lo in stride(from: 0, to: work.count, by: ExpertStore.defaultLoadBatch) {
+            let hi = min(lo + ExpertStore.defaultLoadBatch, work.count)
+            let batchWork = Array(work[lo ..< hi])
+            queue.async { [weak self] in
+                guard let self else { return }
+                let batch = self.store.readRecords(batchWork.map(\.key))
+                self.fence.lock()
+                for (i, item) in batchWork.enumerated() {
+                    guard self.entries[item.slot].generation == item.generation,
+                        self.entries[item.slot].key == item.key
+                    else { continue }
+                    self.entries[item.slot].record = batch[i]
+                    self.entries[item.slot].loading = false
+                }
+                self.fence.broadcast()
+                self.fence.unlock()
+            }
+        }
+    }
+
+    func take(_ key: ExpertKey) -> StagedExpertRecord? {
+        guard !entries.isEmpty else { return nil }
+        fence.lock()
+        defer { fence.unlock() }
+        while true {
+            guard let slot = entries.firstIndex(where: { $0.key == key }) else { return nil }
+            if entries[slot].loading {
+                fence.wait()
+                continue
+            }
+            let record = entries[slot].record
+            entries[slot].key = nil
+            entries[slot].record = nil
+            return record
+        }
+    }
+
+    func discard(_ key: ExpertKey) {
+        fence.lock()
+        if let slot = entries.firstIndex(where: { $0.key == key }), !entries[slot].loading {
+            entries[slot].key = nil
+            entries[slot].record = nil
+        }
+        fence.unlock()
+    }
+
+    func clear() {
+        queue.sync {}
+        fence.lock()
+        for i in entries.indices {
+            entries[i].generation += 1
+            entries[i].key = nil
+            entries[i].loading = false
+            entries[i].record = nil
+        }
+        fence.broadcast()
+        fence.unlock()
+    }
+}
 
 /// A fixed pool of expert slots shared across all layers (uniform shape), with
 /// CLOCK eviction. `ensure` maps (layer, expert) keys to slot indices, loading
@@ -179,12 +350,32 @@ public final class SlotPool {
     private var hand = 0
     public private(set) var hits = 0
     public private(set) var misses = 0
+    public private(set) var prefetchPromotions = 0
     // Per-layer normalized heat: heat[l][e] sums to 1 per layer.
     // Update on each MoE dispatch: hit experts get + (1-alpha)/k, all decay by alpha.
     // alpha <1, controlled by SLOTSTREAM_HEAT_ALPHA (or legacy SLOTSTREAM_LFU_DECAY).
     private var heat: [[Double]] = Array(repeating: Array(repeating: 1.0/512.0, count: 512), count: 48)
     private var lastAccess: [ExpertKey: Int] = [:]
     private var lfuClock = 0
+    static let prefetchRecords: Int = {
+        guard let raw = ProcessInfo.processInfo.environment["SLOTSTREAM_PREFETCH_RECORDS"],
+            let n = Int(raw)
+        else { return 32 }
+        return min(max(n, 0), 256)
+    }()
+    static let prefetchLookahead: Int = {
+        guard let raw = ProcessInfo.processInfo.environment["SLOTSTREAM_PREFETCH_LAYERS"],
+            let n = Int(raw)
+        else { return 4 }
+        return min(max(n, 1), Geometry.layers)
+    }()
+    static let prefetchDistancePower: Double = {
+        guard let raw = ProcessInfo.processInfo.environment["SLOTSTREAM_PREFETCH_DISTANCE_POWER"],
+            let value = Double(raw), value >= 0, value <= 4
+        else { return 1.0 }
+        return value
+    }()
+    private lazy var prefetch = ExpertPrefetchRing(capacity: Self.prefetchRecords, store: store)
     static let heatAlpha: Double = {
         if let s = ProcessInfo.processInfo.environment["SLOTSTREAM_HEAT_ALPHA"], let v = Double(s), v >= 0, v <= 1 { return v }
         if let s = ProcessInfo.processInfo.environment["SLOTSTREAM_LFU_DECAY"], let v = Double(s), v >= 0, v <= 1 { return v }
@@ -246,6 +437,7 @@ public final class SlotPool {
     public func resize(to newSlots: Int) {
         let n = max(newSlots, 1)
         if n == slots { return }
+        clearPrefetch()
         unpinAll()
         if n > slots {
             // grow, preserving contents in the slot-index prefix
@@ -333,6 +525,40 @@ public final class SlotPool {
         return b
     }
 
+    /// Keep a rotating, distance-adjusted window ahead of decode. Nearby
+    /// layers receive more ring records; within each layer, LFU heat predicts
+    /// which experts are worth reading. Reconciliation preserves records still
+    /// in the target window and rotates the rest through the bounded ring.
+    public func prefetchDecode(afterLayer: Int, layerCount: Int) {
+        guard Self.prefetchRecords > 0, layerCount > 0 else { return }
+        let staleLayer = (afterLayer % layerCount + layerCount) % layerCount
+        let lookahead = min(Self.prefetchLookahead, layerCount)
+        let weights = (1 ... lookahead).map { 1.0 / pow(Double($0), Self.prefetchDistancePower) }
+        let weightSum = weights.reduce(0, +)
+        var targets = weights.map { Int((Double(prefetch.capacity) * $0 / weightSum).rounded(.down)) }
+        var remainder = prefetch.capacity - targets.reduce(0, +)
+        var d = 0
+        while remainder > 0 {
+            targets[d] += 1
+            remainder -= 1
+            d = (d + 1) % lookahead
+        }
+
+        var desired: [ExpertKey] = []
+        for distance in 1 ... lookahead {
+            let layer = (staleLayer + distance) % layerCount
+            let hottest = (0 ..< cfg.numExperts)
+                .filter { map[ExpertKey(layer, $0)] == nil }
+                .sorted { heat[layer][$0] > heat[layer][$1] }
+            desired.append(contentsOf: hottest.prefix(targets[distance - 1]).map { ExpertKey(layer, $0) })
+        }
+        prefetch.reconcile(desired)
+    }
+
+    public func clearPrefetch() {
+        prefetch.clear()
+    }
+
     /// 48 x 512 heat matrix: per-layer probability (sums to 1 per layer).
     public func heatMatrix() -> [[Double]] {
         heat
@@ -364,6 +590,7 @@ public final class SlotPool {
         var result = Array(repeating: -1, count: keys.count)
         var missKeys: [ExpertKey] = []
         var missPos: [Int] = []
+        var prefetchedRecords: [StagedExpertRecord?] = []
         let isDecodeOnly = Self.lfuDecodeOnly
         let isPrefillBatch = keys.count > 30
         let shouldCount = !(isDecodeOnly && isPrefillBatch)
@@ -374,6 +601,7 @@ public final class SlotPool {
                 lastAccess[k] = lfuClock; lfuClock += 1
             }
             if let s = map[k] {
+                prefetch.discard(k)
                 result[i] = s
                 refBit[s] = true
                 pinned[s] = true
@@ -381,6 +609,7 @@ public final class SlotPool {
             } else {
                 missKeys.append(k)
                 missPos.append(i)
+                prefetchedRecords.append(prefetch.take(k))
                 misses += 1
             }
         }
@@ -402,17 +631,32 @@ public final class SlotPool {
                 pinned[s] = true
                 slotIdx.append(Int32(s))
             }
+            var demand: [Int] = []
+            var promoted = false
+            for i in missKeys.indices {
+                if let record = prefetchedRecords[i] {
+                    let rows = store.materialize(record)
+                    let idx = MLXArray([slotIdx[i]])
+                    for p in 0 ..< 9 { pools[p][idx] = rows[p] }
+                    prefetchPromotions += 1
+                    promoted = true
+                } else {
+                    demand.append(i)
+                }
+            }
+            if promoted { eval(pools) }
             // Bound staging independently of how many unique experts this
             // token batch routed. Evaluating each scatter before reading the
             // next slice lets the prior raw buffers be released immediately.
             var lo = 0
-            while lo < missKeys.count {
-                let hi = min(lo + ExpertStore.defaultLoadBatch, missKeys.count)
+            while lo < demand.count {
+                let hi = min(lo + ExpertStore.defaultLoadBatch, demand.count)
+                let selection = Array(demand[lo ..< hi])
                 let tIO = Date()
-                let batch = store.readBatch(Array(missKeys[lo ..< hi]))
+                let batch = store.readBatch(selection.map { missKeys[$0] })
                 ioSeconds += -tIO.timeIntervalSinceNow
                 let tScatter = Date()
-                let idx = MLXArray(Array(slotIdx[lo ..< hi]))
+                let idx = MLXArray(selection.map { slotIdx[$0] })
                 for p in 0 ..< 9 {
                     pools[p][idx] = batch[p]
                 }
@@ -420,7 +664,7 @@ public final class SlotPool {
                 scatterSeconds += -tScatter.timeIntervalSinceNow
                 lo = hi
             }
-            recordsFetched += missKeys.count
+            recordsFetched += demand.count
             fillSeconds += -tMiss.timeIntervalSinceNow
             for (j, i) in missPos.enumerated() { result[i] = Int(slotIdx[j]) }
         }
@@ -449,6 +693,7 @@ public final class SlotPool {
     public func resetStats() {
         hits = 0
         misses = 0
+        prefetchPromotions = 0
         ioSeconds = 0
         scatterSeconds = 0
         fillSeconds = 0

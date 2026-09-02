@@ -274,6 +274,12 @@ public final class Qwen4ExpModel {
 
         let chunkStart = Date()
         let isPrefillChunk = S > 64 // decode is 1 token, don't spam layers
+        if S == 1 {
+            pool.prefetchDecode(afterLayer: runLayers - 1, layerCount: runLayers)
+        } else {
+            // Never mix speculative decode IO with the measured dense-prefill path.
+            pool.clearPrefetch()
+        }
         for l in 0 ..< runLayers {
             if let p = ple[l] {
                 h = h + p(h, history: history, nNew: S, cache: state.linear[l] ?? nil)
@@ -302,6 +308,9 @@ public final class Qwen4ExpModel {
             // synchronize the layer so pool references release before the next
             // layer's ensure() scatters (keeps slot writes in place, see PLAN §4.2)
             eval(h)
+            if S == 1 {
+                pool.prefetchDecode(afterLayer: l, layerCount: runLayers)
+            }
             if isPrefillChunk && (l % 8 == 7 || l == runLayers - 1) {
                 let elapsed = -chunkStart.timeIntervalSinceNow
                 let tps = elapsed > 0 ? Double(S) / elapsed : 0
