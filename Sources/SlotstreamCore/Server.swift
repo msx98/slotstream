@@ -1271,8 +1271,9 @@ public final class Server {
 
         /// Returns the substring of `buf` starting at `after`, minus any
         /// <tool_call>...</tool_call> block ranges that fall at or after
-        /// `after`. Used so content deltas after </think> don't leak the raw
-        /// tool-call XML alongside the parsed tool_calls deltas.
+        /// `after`, and truncated at the first unclosed <tool_call> opener
+        /// in any remaining gap. Used so content deltas after </think> don't
+        /// leak the raw tool-call XML alongside the parsed tool_calls deltas.
         func cleanContentTail(
             _ buf: String, after: String.Index,
             toolCloseRegex: NSRegularExpression?
@@ -1299,8 +1300,24 @@ public final class Server {
                 cursor = tr.location + tr.length
             }
             if cursor < total {
-                pieces.append(ns.substring(
-                    with: NSRange(location: cursor, length: total - cursor)))
+                // If the gap after the last closed block still contains an
+                // unclosed <tool_call>, stop at its opener so the raw XML
+                // (the opening tag, <function=NAME>, <parameter=...>...</parameter>
+                // contents, and the </function></tool_call> close) does not
+                // get streamed as content. Once that block closes the next
+                // pass through the callback will pick up the bytes after
+                // </tool_call> as content.
+                let gap = ns.substring(
+                    with: NSRange(location: cursor, length: total - cursor))
+                let endOfSafeContent: String.Index
+                if let r = gap.range(of: "<tool_call>") {
+                    endOfSafeContent = r.lowerBound
+                } else {
+                    endOfSafeContent = gap.endIndex
+                }
+                if endOfSafeContent > gap.startIndex {
+                    pieces.append(String(gap[..<endOfSafeContent]))
+                }
             }
             return pieces.joined()
         }
