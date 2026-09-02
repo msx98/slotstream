@@ -3,6 +3,7 @@
 import ArgumentParser
 import Foundation
 import MLX
+import MLXNN
 import SlotstreamCore
 
 struct Slotstream: ParsableCommand {
@@ -15,9 +16,99 @@ struct Slotstream: ParsableCommand {
             NgramGolden.self, DequantGolden.self, TemplateCheck.self, SamplerGolden.self, GovernorCheck.self,
             PrefixCheck.self, ElasticDrill.self, RuntimeCheck.self, PullCheck.self,
             MTPParity.self, MTPAccept.self, MTPCheck.self, MTPFixtureInputs.self, MTPBench.self,
-            Heat.self, KVRoundtripCheck.self,
+            Heat.self, KVRoundtripCheck.self, MoECheck.self,
         ]
     )
+}
+
+/// Weights-free equivalence check for the sorted grouped expert path.
+struct MoECheck: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "moe-check",
+        abstract: "Compare grouped and ordinary quantized expert routing on synthetic weights")
+
+    func run() throws {
+        let experts = 8
+        let hidden = 64
+        let intermediate = 64
+        let topK = 4
+        let tokens = 17  // 68 assignments exercises MLX's grouped-kernel thresholds.
+
+        func values(_ count: Int, salt: Int) -> [Float] {
+            (0 ..< count).map { i in
+                Float(((i * 37 + salt * 17) % 101) - 50) / 64
+            }
+        }
+        func projection(_ output: Int, _ input: Int, _ salt: Int)
+            -> (weight: MLXArray, scales: MLXArray, biases: MLXArray?)
+        {
+            let dense = MLXArray(values(experts * output * input, salt: salt),
+                                 [experts, output, input]).asType(.bfloat16)
+            let (weight, scales, biases) = quantized(dense, groupSize: 64, bits: 4)
+            return (weight, scales, biases)
+        }
+
+        let x = MLXArray(values(tokens * hidden, salt: 1), [1, tokens, hidden])
+            .asType(.bfloat16)
+        let routeValues = (0 ..< tokens * topK).map { i in
+            UInt32((i * 5 + i / topK * 3 + 1) % experts)
+        }
+        let routes = MLXArray(routeValues, [1, tokens, topK])
+        let gate = projection(intermediate, hidden, 2)
+        let up = projection(intermediate, hidden, 3)
+        let down = projection(hidden, intermediate, 4)
+
+        func ordinaryOutputs(_ input: MLXArray, _ indices: MLXArray) -> MLXArray {
+            let expanded = input.expandedDimensions(axes: [-2, -3])
+            let g = gatherQuantizedMM(
+                expanded, gate.weight, scales: gate.scales, biases: gate.biases,
+                rhsIndices: indices, transpose: true, groupSize: 64, bits: 4)
+            let u = gatherQuantizedMM(
+                expanded, up.weight, scales: up.scales, biases: up.biases,
+                rhsIndices: indices, transpose: true, groupSize: 64, bits: 4)
+            let d = gatherQuantizedMM(
+                MLXNN.silu(g) * u, down.weight, scales: down.scales, biases: down.biases,
+                rhsIndices: indices, transpose: true, groupSize: 64, bits: 4)
+            return d.squeezed(axis: -2)
+        }
+
+        let ordinary = ordinaryOutputs(x, routes)
+        let grouped = quantizedExpertOutputs(
+            x, indices: routes, gate: gate, up: up, down: down,
+            groupSize: 64, bits: 4)
+        let repeated = quantizedExpertOutputs(
+            x, indices: routes, gate: gate, up: up, down: down,
+            groupSize: 64, bits: 4)
+        eval(ordinary, grouped, repeated)
+
+        let maxAbs = (ordinary.asType(.float32) - grouped.asType(.float32))
+            .abs().max().item(Float.self)
+        let scale = ordinary.asType(.float32).abs().max().item(Float.self)
+        let relative = maxAbs / max(scale, 1e-6)
+        let repeatDiff = (repeated.asType(.float32) - grouped.asType(.float32))
+            .abs().max().item(Float.self)
+        let smallX = x[0..., ..<4, 0...]
+        let smallRoutes = routes[0..., ..<4, 0...]
+        let smallOrdinary = ordinaryOutputs(smallX, smallRoutes)
+        let smallAutomatic = quantizedExpertOutputs(
+            smallX, indices: smallRoutes, gate: gate, up: up, down: down,
+            groupSize: 64, bits: 4)
+        eval(smallOrdinary, smallAutomatic)
+        let smallDiff = (smallAutomatic.asType(.float32) - smallOrdinary.asType(.float32))
+            .abs().max().item(Float.self)
+        guard grouped.shape == [1, tokens, topK, hidden], relative < 2e-2,
+            repeatDiff == 0, smallDiff == 0
+        else {
+            print(String(format:
+                "FAIL  grouped MoE shape=%@, max abs %.6f, rel %.6f, repeat diff %.6f, small diff %.6f",
+                String(describing: grouped.shape), maxAbs, relative, repeatDiff, smallDiff))
+            throw ExitCode(2)
+        }
+        print(String(format:
+            "PASS  grouped MoE: %d routes, max abs %.6f, rel %.6f, repeat/small diff %.1f/%.1f",
+            tokens * topK, maxAbs, relative, repeatDiff, smallDiff))
+        print("MOE CHECK PASS")
+    }
 }
 
 /// Weights-free regressions for process and cache safety invariants that are

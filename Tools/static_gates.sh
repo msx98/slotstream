@@ -17,6 +17,7 @@ if grep -En 'File\(path: .*sha256: nil\)' Sources/slotstream/PinnedModel.swift; 
 fi
 
 .build/release/slotstream runtime-check
+.build/release/slotstream moe-check
 .build/release/slotstream pull-check
 Tools/planner_gates.sh
 Tools/installer_gates.sh

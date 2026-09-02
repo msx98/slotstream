@@ -420,6 +420,53 @@ final class GDNLayer {
 
 // MARK: - MoE
 
+/// Run the three routed expert projections, grouping assignments by physical
+/// expert slot when there is enough work for MLX's sorted-RHS QMM kernel.
+public func quantizedExpertOutputs(
+    _ x: MLXArray,
+    indices: MLXArray,
+    gate: (weight: MLXArray, scales: MLXArray, biases: MLXArray?),
+    up: (weight: MLXArray, scales: MLXArray, biases: MLXArray?),
+    down: (weight: MLXArray, scales: MLXArray, biases: MLXArray?),
+    groupSize: Int,
+    bits: Int
+) -> MLXArray {
+    var xe = x.expandedDimensions(axes: [-2, -3])
+    var rhs = indices
+    var inverseOrder: MLXArray?
+
+    // MLX 0.31's grouped kernel requires >=64 assignments and at least four
+    // assignments per RHS matrix. The latter counts the whole global slot pool.
+    let shouldSort = indices.size >= max(64, 4 * gate.weight.dim(0))
+    if shouldSort {
+        let routesPerToken = indices.dim(-1)
+        let flat = indices.flattened()
+        let order = argSort(flat)
+        inverseOrder = argSort(order)
+        xe = xe.flattened(start: 0, end: -3)[order.floorDivide(routesPerToken)]
+        rhs = flat[order]
+    }
+
+    let g = gatherQuantizedMM(
+        xe, gate.weight, scales: gate.scales, biases: gate.biases,
+        rhsIndices: rhs, transpose: true, groupSize: groupSize, bits: bits,
+        sortedIndices: shouldSort)
+    let u = gatherQuantizedMM(
+        xe, up.weight, scales: up.scales, biases: up.biases,
+        rhsIndices: rhs, transpose: true, groupSize: groupSize, bits: bits,
+        sortedIndices: shouldSort)
+    let hidden = MLXNN.silu(g) * u
+    var output = gatherQuantizedMM(
+        hidden, down.weight, scales: down.scales, biases: down.biases,
+        rhsIndices: rhs, transpose: true, groupSize: groupSize, bits: bits,
+        sortedIndices: shouldSort)
+
+    if let inverseOrder {
+        output = output[inverseOrder].reshaped(indices.shape + [1, x.dim(-1)])
+    }
+    return output.squeezed(axis: -2)
+}
+
 final class MoELayer {
     let cfg: ModelConfig
     let layer: Int
@@ -466,19 +513,12 @@ final class MoELayer {
         let slotIds = expertIds.map { Int32(slotOf[seen[ExpertKey(layer, Int($0))]!]) }
         let slotIdx = MLXArray(slotIds, [B, S, cfg.topK])
 
-        // SwitchGLU semantics: expand x to (B,S,1,1,H), gather over pool
-        let xe = x.expandedDimensions(axes: [-2, -3])
-        let g = gatherQuantizedMM(
-            xe, pool.pools[0], scales: pool.pools[1], biases: pool.pools[2],
-            rhsIndices: slotIdx, transpose: true, groupSize: cfg.qGroup, bits: cfg.qBits)
-        let u = gatherQuantizedMM(
-            xe, pool.pools[3], scales: pool.pools[4], biases: pool.pools[5],
-            rhsIndices: slotIdx, transpose: true, groupSize: cfg.qGroup, bits: cfg.qBits)
-        let hidden = MLXNN.silu(g) * u
-        let d = gatherQuantizedMM(
-            hidden, pool.pools[6], scales: pool.pools[7], biases: pool.pools[8],
-            rhsIndices: slotIdx, transpose: true, groupSize: cfg.qGroup, bits: cfg.qBits)
-        let experts = d.squeezed(axis: -2)  // (B,S,topK,H)
+        let experts = quantizedExpertOutputs(
+            x, indices: slotIdx,
+            gate: (pool.pools[0], pool.pools[1], pool.pools[2]),
+            up: (pool.pools[3], pool.pools[4], pool.pools[5]),
+            down: (pool.pools[6], pool.pools[7], pool.pools[8]),
+            groupSize: cfg.qGroup, bits: cfg.qBits)
         let routed = (experts * weights.expandedDimensions(axis: -1)).sum(axis: -2).asType(x.dtype)
 
         let shared = sharedDownProj(MLXNN.silu(sharedGateProj(x)) * sharedUpProj(x))

@@ -26,6 +26,7 @@ let package = Package(
             dependencies: [
                 "SlotstreamCore",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
+                .product(name: "MLXNN", package: "mlx-swift"),
             ],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),

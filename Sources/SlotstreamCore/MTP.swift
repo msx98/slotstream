@@ -95,18 +95,10 @@ final class ResidentMoE {
         let weights = softmax(takeAlong(logits, idx, axis: -1), axis: -1, precise: true)
         let rhs = idx.asType(.uint32)
 
-        let xe = x.expandedDimensions(axes: [-2, -3])
-        let g = gatherQuantizedMM(
-            xe, gp.0, scales: gp.1, biases: gp.2,
-            rhsIndices: rhs, transpose: true, groupSize: cfg.qGroup, bits: cfg.qBits)
-        let u = gatherQuantizedMM(
-            xe, up.0, scales: up.1, biases: up.2,
-            rhsIndices: rhs, transpose: true, groupSize: cfg.qGroup, bits: cfg.qBits)
-        let hidden = MLXNN.silu(g) * u
-        let d = gatherQuantizedMM(
-            hidden, dp.0, scales: dp.1, biases: dp.2,
-            rhsIndices: rhs, transpose: true, groupSize: cfg.qGroup, bits: cfg.qBits)
-        let experts = d.squeezed(axis: -2)
+        let experts = quantizedExpertOutputs(
+            x, indices: rhs,
+            gate: (gp.0, gp.1, gp.2), up: (up.0, up.1, up.2), down: (dp.0, dp.1, dp.2),
+            groupSize: cfg.qGroup, bits: cfg.qBits)
         let routed = (experts * weights.expandedDimensions(axis: -1)).sum(axis: -2).asType(x.dtype)
 
         let shared = sharedDownProj(MLXNN.silu(sharedGateProj(x)) * sharedUpProj(x))
