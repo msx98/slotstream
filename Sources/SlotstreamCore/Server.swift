@@ -429,9 +429,7 @@ public final class Server {
         guard let raw = json["model"] else { return nil }
         guard let requested = raw as? String else { return "model must be text" }
         guard !requested.isEmpty else { return "model must not be empty" }
-        let accepted = [engine.modelName, "qwen3.8-flash-next:4bit", "qwen38-flash-next-mlx-4bit"]
-        return accepted.contains(requested)
-            ? nil : "model '\(requested)' is not loaded; this server has only '\(engine.modelName)'"
+        return nil
     }
 
     private func openAIModelError(_ json: [String: Any]) -> String? {
@@ -503,7 +501,7 @@ public final class Server {
             return "messages must be an array"
         }
         for (i, m) in raw.enumerated() {
-            let allowedKeys: Set<String> = ["role", "content", "tool_calls", "tool_call_id", "name"]
+            let allowedKeys: Set<String> = ["role", "content", "tool_calls", "tool_call_id", "name", "reasoning_content"]
             let extra = Set(m.keys).subtracting(allowedKeys)
             if !extra.isEmpty {
                 return "messages[\(i)] has unsupported field(s): "
@@ -713,6 +711,12 @@ public final class Server {
             }
             if let tcid = m["tool_call_id"] as? String { out["tool_call_id"] = tcid }
             if let name = m["name"] as? String { out["name"] = name }
+            // Forward prior assistant reasoning so the template can re-emit it as <think>...
+            // (chat_template.jinja reads message.reasoning_content and wraps it as
+            //   <think>\n<reasoning>\n</think>\n<content> when present.)
+            if let rc = m["reasoning_content"] as? String, !rc.isEmpty {
+                out["reasoning_content"] = rc
+            }
             return out
         }
     }
@@ -1056,7 +1060,7 @@ public final class Server {
         // only the prefix before the first block as content. This avoids leaking
         // raw XML and avoids the post-hoc duplicate that required suppression.
         var streamBuf = ""
-        var streamSent = 0
+        var reasoningSent = 0
         var emittedToolCalls = 0
         let toolPattern = "<tool_call>\\s*<function=([^>]+)>\\s*(.*?)\\s*</function>\\s*</tool_call>"
         let paramPattern = "<parameter=([^>]+)>\\s*(.*?)\\s*</parameter>"
@@ -1064,33 +1068,63 @@ public final class Server {
         let callback: ((Int, String) -> Bool)? = stream ? { _, delta in
             guard alive, !delta.isEmpty else { return alive }
             streamBuf += delta
-            // Stream prefix (reasoning) before first tool_call, once.
-            if let r = streamBuf.range(of: "<tool_call>") {
-                let prefix = String(streamBuf[..<r.lowerBound])
-                if prefix.count > streamSent, !prefix.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    let toSend = String(prefix.dropFirst(streamSent))
+            // Flush any newly received reasoning as delta.reasoning_content so
+            // clients (opencode) see progress during long thinking, not silence
+            // until the first </think> or tool tag closes.
+            if let r = streamBuf.range(of: "</think>") {
+                let reasoning = String(streamBuf[..<r.lowerBound])
+                if reasoning.count > reasoningSent {
+                    let toSend = String(reasoning.dropFirst(reasoningSent))
                     if !toSend.isEmpty {
                         let obj: [String: Any] = [
                             "id": rid, "object": "chat.completion.chunk",
                             "created": Int(Date().timeIntervalSince1970), "model": self.engine.modelName,
-                            "choices": [["index": 0, "delta": ["content": toSend], "finish_reason": NSNull()]],
+                            "choices": [["index": 0, "delta": ["reasoning_content": toSend], "finish_reason": NSNull()]],
                         ]
                         let data = try! JSONSerialization.data(withJSONObject: obj)
                         alive = self.chunk(fd, Data("data: ".utf8) + data + Data("\n\n".utf8))
-                        streamSent = prefix.count
+                        reasoningSent = reasoning.count
+                    }
+                }
+                // Anything after </think> (or before any tool tag in a tool-only reply)
+                // is real content; stream subsequent deltas as content.
+                let after = streamBuf.index(after: r.upperBound)
+                let tail = String(streamBuf[after...])
+                if !tail.isEmpty {
+                    let obj: [String: Any] = [
+                        "id": rid, "object": "chat.completion.chunk",
+                        "created": Int(Date().timeIntervalSince1970), "model": self.engine.modelName,
+                        "choices": [["index": 0, "delta": ["content": tail], "finish_reason": NSNull()]],
+                    ]
+                    let data = try! JSONSerialization.data(withJSONObject: obj)
+                    alive = self.chunk(fd, Data("data: ".utf8) + data + Data("\n\n".utf8))
+                }
+            } else if let r = streamBuf.range(of: "<tool_call>") {
+                // Tool replies may not include </think>; stream the prefix as
+                // reasoning_content so it surfaces the same way.
+                let prefix = String(streamBuf[..<r.lowerBound])
+                if prefix.count > reasoningSent, !prefix.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    let toSend = String(prefix.dropFirst(reasoningSent))
+                    if !toSend.isEmpty {
+                        let obj: [String: Any] = [
+                            "id": rid, "object": "chat.completion.chunk",
+                            "created": Int(Date().timeIntervalSince1970), "model": self.engine.modelName,
+                            "choices": [["index": 0, "delta": ["reasoning_content": toSend], "finish_reason": NSNull()]],
+                        ]
+                        let data = try! JSONSerialization.data(withJSONObject: obj)
+                        alive = self.chunk(fd, Data("data: ".utf8) + data + Data("\n\n".utf8))
+                        reasoningSent = prefix.count
                     }
                 }
             } else {
-                // No tool tag yet — stream content normally.
                 let obj: [String: Any] = [
                     "id": rid, "object": "chat.completion.chunk",
                     "created": Int(Date().timeIntervalSince1970), "model": self.engine.modelName,
-                    "choices": [["index": 0, "delta": ["content": delta], "finish_reason": NSNull()]],
+                    "choices": [["index": 0, "delta": ["reasoning_content": delta], "finish_reason": NSNull()]],
                 ]
                 let data = try! JSONSerialization.data(withJSONObject: obj)
                 alive = self.chunk(fd, Data("data: ".utf8) + data + Data("\n\n".utf8))
-                streamSent += delta.count
-                // No tool tag, nothing more to do.
+                reasoningSent += delta.count
                 return alive
             }
             // Incremental tool_calls: emit each newly completed block.

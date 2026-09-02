@@ -225,12 +225,33 @@ public final class Generator {
         // Disk cache: try longest chunk-aligned prefix on disk before falling back to RAM cache
         var diskState: Qwen4ExpModel.State? = nil
         var diskHitLen: Int? = nil
-        if !isVision, let l = DiskCache.longestPrefixHit(for: promptIds, chunk: prefillChunk) {
-            let curReused = hit?.reused ?? 0
-            if l > curReused, let ds = DiskCache.loadState(for: Array(promptIds[0..<l]), template: model.makeState()) {
-                diskState = ds
-                diskHitLen = l
-                FileHandle.standardError.write("kvcache disk hit: \(l)/\(promptIds.count) tokens\n".data(using: .utf8)!)
+        if !isVision {
+            // Embedding extractor: pull the embedding rows for chunk `d`
+            // (tokens [d*prefillChunk, (d+1)*prefillChunk)) on demand. The
+            // chain walk bails at the first miss so we never compute past
+            // the depth we actually consume.
+            let m = model
+            let pc = prefillChunk
+            let embed: (Int) -> [Float]? = { d in
+                let lo = d * pc
+                let hi = min(lo + pc, promptIds.count)
+                guard lo < promptIds.count else { return nil }
+                let ids = MLXArray(promptIds[lo..<hi].map { Int32($0) }, [1, hi - lo])
+                let rows = m.resident.embed(ids).asType(.float32)
+                eval(rows)
+                return rows.reshaped([rows.dim(1) * rows.dim(2)]).asArray(Float.self)
+            }
+            if let l = DiskCache.longestPrefixHit(chunk: prefillChunk, embed: embed) {
+                let depth = l / prefillChunk
+                let curReused = hit?.reused ?? 0
+                if l > curReused, let ds = DiskCache.loadState(
+                    for: embed, depth: depth, tokenIds: Array(promptIds[0..<l]),
+                    template: model.makeState())
+                {
+                    diskState = ds
+                    diskHitLen = l
+                    FileHandle.standardError.write("kvcache disk hit: \(l)/\(promptIds.count) tokens\n".data(using: .utf8)!)
+                }
             }
         }
         let state: Qwen4ExpModel.State
@@ -330,7 +351,38 @@ public final class Generator {
             // hit would reload. log() inside saveAsync tells us if/when it
             // actually wrote — silent failure here is not acceptable.
             if !isVision, DiskCache.enabled, hi % prefillChunk == 0, hi < promptIds.count {
-                DiskCache.saveAsync(state: state, tokens: Array(promptIds[0..<hi]))
+                let depth = hi / prefillChunk
+                // Per-chunk embedding hash (not cumulative). The chain walk in
+                // ChunkIndex produces `makeKey(parent: chain[d-1], embeddings: embed(d))`,
+                // so the save side has to match that shape — parent_sha comes
+                // from walking depths 0..<depth, the chunk embeddings are
+                // exactly the rows for tokens [depth-1 .. depth].
+                let chunkLo = (depth - 1) * prefillChunk
+                let chunkHi = chunkLo + prefillChunk
+                let chunkIds = MLXArray(
+                    promptIds[chunkLo..<chunkHi].map { Int32($0) },
+                    [1, prefillChunk])
+                let chunkRows = model.resident.embed(chunkIds).asType(.float32)
+                eval(chunkRows)
+                let chunkEmbeds = chunkRows
+                    .reshaped([chunkRows.dim(1) * chunkRows.dim(2)])
+                    .asArray(Float.self)
+                var parentSha: String? = nil
+                for d in 0..<(depth - 1) {
+                    let lo = d * prefillChunk
+                    let hi2 = lo + prefillChunk
+                    let ids2 = MLXArray(
+                        promptIds[lo..<hi2].map { Int32($0) }, [1, prefillChunk])
+                    let r2 = model.resident.embed(ids2).asType(.float32)
+                    eval(r2)
+                    let e2 = r2.reshaped([r2.dim(1) * r2.dim(2)]).asArray(Float.self)
+                    parentSha = ChunkIndex.makeKey(parentSha: parentSha, embeddings: e2)
+                }
+                let key = ChunkIndex.makeKey(parentSha: parentSha, embeddings: chunkEmbeds)
+                DiskCache.saveAsync(
+                    state: state, tokenIds: Array(promptIds[0..<hi]),
+                    key: key, parentSha: parentSha, depth: depth,
+                    embeddings: chunkEmbeds)
             }
             i = hi
         }
