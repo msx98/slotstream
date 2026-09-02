@@ -698,8 +698,10 @@ public enum DiskCache {
     private static func sweepOrphans() {
         let fm = FileManager.default
         guard let entries = try? fm.contentsOfDirectory(
-            at: dir, includingPropertiesForKeys: nil) else { return }
+            at: dir, includingPropertiesForKeys: [.isDirectoryKey]) else { return }
         for entry in entries {
+            guard (try? entry.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
+            else { continue }
             let dataPath = entry.appendingPathComponent("data.kv")
             if !fm.fileExists(atPath: dataPath.path) {
                 try? fm.removeItem(at: entry)
