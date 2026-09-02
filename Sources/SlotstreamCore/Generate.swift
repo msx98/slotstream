@@ -341,7 +341,8 @@ public final class Generator {
         // has no draft cache to extend; finish that request plain rather than
         // speculating over a misaligned head (unreachable in serve, where the
         // mode is fixed per process; the A/B tools flip it per request).
-        let stateKnowsMTP = hit == nil || hit?.state.mtp != nil
+        let stateKnowsMTP = reused == 0
+            || (state.mtp != nil && state.mtp!.offset == max(0, state.tokenCount - 1))
         // Vision disables speculative decode (needs vision-aware verify)
         let mtpHead: MTPHead? = isVision ? nil : (speculationEnabled && stateKnowsMTP ? model.mtpHead : nil)
         if mtpHead != nil && state.mtp == nil { state.mtp = MTPState() }
@@ -441,7 +442,7 @@ public final class Generator {
                 DiskCache.saveAsync(
                     state: state, tokenIds: Array(promptIds[0..<hi]),
                     key: key, parentSha: parentSha, depth: depth,
-                    embeddings: chunkEmbeds)
+                    embeddings: chunkEmbeds, parentTokenCount: chunkLo)
             }
             i = hi
         }

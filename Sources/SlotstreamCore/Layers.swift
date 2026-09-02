@@ -121,6 +121,21 @@ final class KVCache {
         self.values = values
         self.offset = offset
     }
+
+    func append(keys k: MLXArray, values v: MLXArray) -> Bool {
+        guard k.ndim == 4, v.ndim == 4,
+              k.dim(0) == v.dim(0), k.dim(1) == v.dim(1),
+              k.dim(2) == v.dim(2), k.dim(3) == v.dim(3)
+        else { return false }
+        if let oldK = keys, let oldV = values {
+            guard oldK.dim(0) == k.dim(0), oldK.dim(1) == k.dim(1),
+                  oldK.dim(3) == k.dim(3), oldV.dim(0) == v.dim(0),
+                  oldV.dim(1) == v.dim(1), oldV.dim(3) == v.dim(3)
+            else { return false }
+        }
+        _ = updateAndFetch(k, v)
+        return true
+    }
 }
 
 /// Grown in blocks like KVCache rather than re-concatenated per token: a
@@ -156,6 +171,15 @@ final class IndexerCache {
 
     func materializeStorage() {
         if let b = buf { eval(b) }
+    }
+
+    func append(_ arr: MLXArray) -> Bool {
+        guard arr.ndim == 3 else { return false }
+        if let old = buf {
+            guard old.dim(0) == arr.dim(0), old.dim(2) == arr.dim(2) else { return false }
+        }
+        _ = update(arr)
+        return true
     }
 }
 

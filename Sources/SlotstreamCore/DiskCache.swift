@@ -3,10 +3,11 @@
 //   ~/.slotstream/kvcache/
 //     metadata.db                 SQLite index (parent chains, last_used, sizes)
 //     <key>/
-//       data.kv                   saved state arrays (one .kv.partial is
+//       data.kv                   chunk delta + endpoint recurrent state
+//                                 (one .kv.partial is
 //                                 rewritten atomically; final name is data.kv)
-//       parent_sha.bin            parent chunk's key (32 bytes hex), empty at depth 0
-//       emb_sha.bin               sha256 of the chunk's embedding rows (32 bytes hex)
+//       parent_sha.bin            parent chunk's key as hex UTF-8, empty at depth 0
+//       emb_sha.bin               embedding sha256 as hex UTF-8
 // Key derivation lives in ChunkIndex.makeKey and binds chunks to their
 // ancestors: sha256(parent_sha || sha256(chunk_embeddings)). Two conversations
 // that share the first 4096 tokens but diverge at position 4097 get two
@@ -106,12 +107,20 @@ public enum DiskCache {
         parentSha: String?,
         depth: Int,
         embeddings: [Float],
+        parentTokenCount: Int,
         model: String = "qwen38"
     ) {
         guard enabled else { return }
         let embSha = embeddingSha(embeddings: embeddings)
         let base = dir.appendingPathComponent(key, isDirectory: true)
         let cp = state.checkpoint()
+        let tokenCount = tokenIds.count
+        guard parentTokenCount >= 0, parentTokenCount < tokenCount,
+              cp.tokenCount == tokenCount
+        else {
+            log("SAVE FAILED for \(tokenCount) tokens depth=\(depth): invalid parent/token boundary")
+            return
+        }
         log("save queued: \(tokenIds.count) tokens depth=\(depth) key=\(key.prefix(12))")
         let t0 = Date()
         saveQueue.async {
@@ -119,7 +128,7 @@ public enum DiskCache {
                 // Already complete: skip. The check happens after queue dispatch
                 // so concurrent saves of the same key serialize on the queue.
                 let dataPath = base.appendingPathComponent("data.kv")
-                if FileManager.default.fileExists(atPath: dataPath.path) {
+                if cacheFileVersion(at: dataPath) == 4 {
                     let wasIndexed = ChunkIndex.shared.contains(key: key)
                     if wasIndexed {
                         ChunkIndex.shared.touch(key: key)
@@ -131,6 +140,10 @@ public enum DiskCache {
                     let reconciliation = wasIndexed ? "" : "; restored missing index row"
                     log("save skipped: \(tokenIds.count) tokens depth=\(depth) key=\(key.prefix(12)) already complete on disk\(reconciliation)")
                     return
+                }
+                if FileManager.default.fileExists(atPath: dataPath.path) {
+                    ChunkIndex.shared.remove(key: key)
+                    log("save replacing: depth=\(depth) key=\(key.prefix(12)) old or malformed cache format")
                 }
                 try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
                 let partialPath = base.appendingPathComponent("data.kv.partial")
@@ -154,11 +167,16 @@ public enum DiskCache {
                 // <shape,json,bytes> format identical to the old layout.
                 let meta: [String: Any] = [
                     "tokenCount": cp.tokenCount,
+                    "parentTokenCount": parentTokenCount,
                     "ngramCtx": cp.ngramCtx,
-                    "kvOffsets": cp.kvOffsets.reduce(into: [String: Int]()) { $0[String($1.key)] = $1.value },
-                    "indexerOffsets": cp.indexerOffsets.reduce(into: [String: Int]()) { $0[String($1.key)] = $1.value },
-                    "mtpOffset": cp.mtpOffset,
-                    "version": 3
+                    "linearLayers": cp.linearLayers,
+                    "pleLayers": cp.pleConv.keys.sorted(),
+                    "kvLayers": cp.kvOffsets.keys.sorted(),
+                    "indexerLayers": cp.indexerOffsets.keys.sorted(),
+                    "mtpPresent": cp.mtpKV != nil,
+                    "mtpStart": max(0, parentTokenCount - 1),
+                    "mtpEnd": cp.mtpOffset,
+                    "version": 4
                 ]
                 let metaData = try JSONSerialization.data(withJSONObject: meta, options: [])
                 try outHandle.write(contentsOf: metaData)
@@ -194,23 +212,35 @@ public enum DiskCache {
                 for (l, arr) in cp.ssm { try writeArray(arr, name: "ssm_\(l)") }
                 for (l, arr) in cp.pleConv { try writeArray(arr, name: "pleConv_\(l)") }
                 if let lm = cp.lastMulti { try writeArray(lm, name: "lastMulti") }
-                // KV/indexer need live snapshots — checkpoint already pulled the
-                // buffers into cp.mtpKV / cp.mtpIndexer but the main caches
-                // have to be snapshotted here.
-                var kvSnap: [(Int, MLXArray?, MLXArray?)] = []
-                for (l, cache) in state.kv { kvSnap.append((l, cache.keys, cache.values)) }
-                for (l, k, v) in kvSnap {
-                    try writeArray(k, name: "kv_k_\(l)")
-                    try writeArray(v, name: "kv_v_\(l)")
+                let delta = parentTokenCount ..< tokenCount
+                for (l, off) in cp.kvOffsets {
+                    guard off == tokenCount, let pair = cp.kv[l],
+                          pair.keys.dim(2) >= tokenCount,
+                          pair.values.dim(2) >= tokenCount
+                    else { throw ModelError("incomplete KV snapshot for layer \(l)") }
+                    try writeArray(
+                        pair.keys[0..., 0..., delta, 0...], name: "kv_k_\(l)")
+                    try writeArray(
+                        pair.values[0..., 0..., delta, 0...], name: "kv_v_\(l)")
                 }
-                var idxSnap: [(Int, MLXArray?)] = []
-                for (l, cache) in state.indexer { idxSnap.append((l, cache.snapshot())) }
-                for (l, b) in idxSnap { try writeArray(b, name: "indexer_\(l)") }
+                for (l, off) in cp.indexerOffsets {
+                    guard off == tokenCount, let b = cp.indexer[l], b.dim(1) >= tokenCount
+                    else { throw ModelError("incomplete indexer snapshot for layer \(l)") }
+                    try writeArray(b[0..., delta, 0...], name: "indexer_\(l)")
+                }
                 if let (k, v) = cp.mtpKV {
-                    try writeArray(k, name: "mtp_kv_k")
-                    try writeArray(v, name: "mtp_kv_v")
+                    let mtpStart = max(0, parentTokenCount - 1)
+                    guard cp.mtpOffset == max(0, tokenCount - 1),
+                          k.dim(2) >= cp.mtpOffset, v.dim(2) >= cp.mtpOffset,
+                          let b = cp.mtpIndexer, b.dim(1) >= cp.mtpOffset
+                    else { throw ModelError("incomplete MTP snapshot") }
+                    let mtpDelta = mtpStart ..< cp.mtpOffset
+                    try writeArray(k[0..., 0..., mtpDelta, 0...], name: "mtp_kv_k")
+                    try writeArray(v[0..., 0..., mtpDelta, 0...], name: "mtp_kv_v")
+                    try writeArray(b[0..., mtpDelta, 0...], name: "mtp_indexer")
+                } else if cp.mtpOffset != 0 {
+                    throw ModelError("MTP offset has no cache arrays")
                 }
-                if let b = cp.mtpIndexer { try writeArray(b, name: "mtp_indexer") }
 
                 try outHandle.close()
 
@@ -275,6 +305,11 @@ public enum DiskCache {
             let dataPath = base.appendingPathComponent("data.kv")
             let isIndexed = ChunkIndex.shared.contains(key: key)
             let isOnDisk = FileManager.default.fileExists(atPath: dataPath.path)
+            if isOnDisk, cacheFileVersion(at: dataPath) != 4 {
+                if isIndexed { ChunkIndex.shared.remove(key: key) }
+                log("chain break: depth=\(depth + 1) key=\(key.prefix(12)) old or malformed cache format; rebuild required")
+                break
+            }
             if isIndexed && isOnDisk {
                 ChunkIndex.shared.touch(key: key)
                 parentSha = key
@@ -329,9 +364,8 @@ public enum DiskCache {
 
     // MARK: - load
 
-    /// Load a saved chunk into a fresh State. `depth` is the chain depth
-    /// (0 = first chunk). The caller already verified the chain by walking
-    /// it; this just decodes the on-disk file at the resolved key.
+    /// Rebuild a state by applying fixed-size nodes from the chain root through
+    /// `depth`. Depth is the one-based number of consumed chunks.
     public static func loadState(
         for embed: (Int) -> [Float]?,
         depth: Int,
@@ -347,58 +381,67 @@ public enum DiskCache {
             log("load failed: invalid chain depth \(depth)")
             return nil
         }
-        guard let chunkEmb = embed(depth - 1) else {
-            log("load failed: embeddings unavailable at depth=\(depth)")
+        var keys: [String] = []
+        var parentSha: String? = nil
+        for i in 0..<depth {
+            guard let e = embed(i) else {
+                log("load failed: embeddings unavailable at depth=\(i + 1)")
+                return nil
+            }
+            let key = ChunkIndex.makeKey(parentSha: parentSha, embeddings: e)
+            keys.append(key)
+            parentSha = key
+        }
+
+        let state = template
+        for (index, key) in keys.enumerated() {
+            guard applyNode(key: key, depth: index + 1, to: state) else { return nil }
+        }
+        guard state.tokenCount == tokenIds.count else {
+            log("load failed: chain restored \(state.tokenCount) tokens, expected \(tokenIds.count)")
             return nil
         }
-        // Resolve the parent's chain key: walk depths 0..<(depth-1), composing
-        // each step from the per-chunk embeddings. For depth=0 the parent is
-        // nil (no chunks consumed); for depth=N it's chain[N-1] from walking
-        // 0..<(N-1).
-        var parentSha: String? = nil
-        if depth >= 1 {
-            for i in 0..<(depth - 1) {
-                guard let e = embed(i) else {
-                    log("load failed: parent embeddings unavailable at depth=\(i + 1)")
-                    return nil
-                }
-                parentSha = ChunkIndex.makeKey(parentSha: parentSha, embeddings: e)
-            }
-        }
-        let key = ChunkIndex.makeKey(parentSha: parentSha, embeddings: chunkEmb)
+        log("load done: \(tokenIds.count) tokens depth=\(depth) key=\(keys.last!.prefix(12)) from \(depth) nodes")
+        return state
+    }
+
+    private static func applyNode(
+        key: String, depth: Int, to state: Qwen4ExpModel.State
+    ) -> Bool {
         let base = dir.appendingPathComponent(key, isDirectory: true)
         let dataPath = base.appendingPathComponent("data.kv")
+        var accepted = false
+        defer {
+            if !accepted {
+                ChunkIndex.shared.remove(key: key)
+                try? FileManager.default.removeItem(at: dataPath)
+                log("load invalidated: depth=\(depth) key=\(key.prefix(12)) will be rebuilt")
+            }
+        }
         guard FileManager.default.fileExists(atPath: dataPath.path) else {
-            // Index says exists but file is gone — clean up.
             ChunkIndex.shared.remove(key: key)
             log("load failed: depth=\(depth) key=\(key.prefix(12)) indexed but data.kv is missing; removed stale index row")
-            return nil
+            return false
         }
         guard let data = try? Data(contentsOf: dataPath) else {
             log("load: data.kv unreadable for key=\(key.prefix(12))")
-            return nil
+            return false
         }
         guard let nlIndex = data.firstIndex(of: 0x0a) else {
             log("load: no header newline in data.kv for key=\(key.prefix(12)) (size \(data.count))")
-            return nil
+            return false
         }
         let metaData = data[0..<nlIndex]
         guard let meta = try? JSONSerialization.jsonObject(with: metaData) as? [String: Any]
         else {
             log("load: bad meta header JSON for key=\(key.prefix(12))")
-            return nil
+            return false
         }
-        if (meta["version"] as? Int) != 3 {
+        if (meta["version"] as? Int) != 4 {
             log("load: bad version \(meta["version"] ?? -1) for key=\(key.prefix(12))")
-            return nil
+            return false
         }
         var body = data.subdata(in: (nlIndex + 1)..<data.count)
-
-        // Restore scalar fields.
-        let state = template
-        if let ngram = meta["ngramCtx"] as? [Int64] { state.ngramCtx = ngram }
-        else if let ngram = meta["ngramCtx"] as? [Int] { state.ngramCtx = ngram.map { Int64($0) } }
-        if let tc = meta["tokenCount"] as? Int { state.tokenCount = tc }
 
         // Read the body one array at a time. `body` is re-based to index 0
         // so the offsets below are correct. Each array on disk is
@@ -423,9 +466,26 @@ public enum DiskCache {
                 bodyFailure = "invalid array header JSON"
                 break
             }
-            let elementCount = shape.reduce(1, *)
-            let dataBytes = elementCount * 4
-            guard body.count >= headerSize + dataBytes else {
+            var elementCount = 1
+            var shapeIsValid = true
+            for dim in shape {
+                guard dim >= 0 else {
+                    shapeIsValid = false
+                    break
+                }
+                let (next, overflow) = elementCount.multipliedReportingOverflow(by: dim)
+                guard !overflow else {
+                    shapeIsValid = false
+                    break
+                }
+                elementCount = next
+            }
+            let (dataBytes, byteOverflow) = elementCount.multipliedReportingOverflow(by: 4)
+            guard shapeIsValid, !byteOverflow else {
+                bodyFailure = "invalid or overflowing shape for \(name)"
+                break
+            }
+            guard dataBytes <= body.count - headerSize else {
                 bodyFailure = "truncated array data for \(name)"
                 break
             }
@@ -444,60 +504,172 @@ public enum DiskCache {
             }
             arraysByName[name] = MLXArray(floats, shape).asType(dt)
         }
+        if bodyFailure == nil, !body.isEmpty {
+            bodyFailure = "trailing \(body.count) bytes"
+        }
         if let failure = bodyFailure {
             log("load failed: depth=\(depth) key=\(key.prefix(12)) \(failure)")
-            return nil
+            return false
         }
 
-        for l in template.linear.keys {
-            if let a = arraysByName["conv_\(l)"] { template.linear[l]?.convState = a }
-            if let a = arraysByName["ssm_\(l)"] { template.linear[l]?.ssmState = a }
-            if let a = arraysByName["pleConv_\(l)"] { template.linear[l]?.pleConvState = a }
+        guard let tokenCount = meta["tokenCount"] as? Int,
+              let parentTokenCount = meta["parentTokenCount"] as? Int,
+              parentTokenCount == state.tokenCount,
+              tokenCount > parentTokenCount
+        else {
+            log("load failed: depth=\(depth) key=\(key.prefix(12)) non-contiguous token boundary")
+            return false
         }
-        if let a = arraysByName["lastMulti"] { state.lastMulti = a }
+        let deltaCount = tokenCount - parentTokenCount
+        guard let linearLayers = meta["linearLayers"] as? [Int],
+              Set(linearLayers) == Set(state.linear.keys),
+              let kvLayers = meta["kvLayers"] as? [Int],
+              Set(kvLayers) == Set(state.kv.keys),
+              let indexerLayers = meta["indexerLayers"] as? [Int],
+              Set(indexerLayers) == Set(state.indexer.keys),
+              let pleLayers = meta["pleLayers"] as? [Int],
+              Set(pleLayers) == state.expectedPLELayers
+        else {
+            log("load failed: depth=\(depth) key=\(key.prefix(12)) cache layer set mismatch")
+            return false
+        }
 
-        if let kvOffsets = meta["kvOffsets"] as? [String: Int] {
-            for (kStr, off) in kvOffsets {
-                guard let l = Int(kStr), let cache = state.kv[l],
-                      let k = arraysByName["kv_k_\(l)"],
-                      let v = arraysByName["kv_v_\(l)"]
-                else { continue }
-                cache.restoreFromArrays(keys: k, values: v, offset: off)
-            }
-        }
-        if let idxOffsets = meta["indexerOffsets"] as? [String: Int] {
-            for (kStr, off) in idxOffsets {
-                guard let l = Int(kStr), let cache = state.indexer[l],
-                      let b = arraysByName["indexer_\(l)"]
-                else { continue }
-                cache.restore(from: b, offset: off)
-            }
-        }
-        if let mtpOff = meta["mtpOffset"] as? Int, mtpOff > 0 {
-            // Stale entry without MTP arrays would crash the next consume();
-            // bail so the caller rebuilds from scratch.
-            guard arraysByName["mtp_kv_k"] != nil, arraysByName["mtp_kv_v"] != nil
+        for l in linearLayers {
+            guard let conv = arraysByName["conv_\(l)"],
+                  let ssm = arraysByName["ssm_\(l)"],
+                  conv.shape == state.expectedConvShape, conv.dtype == .bfloat16,
+                  ssm.shape == state.expectedSSMShape, ssm.dtype == .float32
             else {
-                log("load failed: depth=\(depth) key=\(key.prefix(12)) mtpOffset=\(mtpOff) but MTP KV arrays are missing")
-                return nil
+                log("load failed: depth=\(depth) key=\(key.prefix(12)) bad recurrent arrays for layer \(l)")
+                return false
             }
         }
-        if let mtpOff = meta["mtpOffset"] as? Int,
-           let k = arraysByName["mtp_kv_k"], let v = arraysByName["mtp_kv_v"]
-        {
-            if state.mtp == nil { state.mtp = MTPState() }
-            state.mtp!.kv.restoreFromArrays(keys: k, values: v, offset: mtpOff)
-            if let b = arraysByName["mtp_indexer"] {
-                state.mtp!.indexer.restore(from: b, offset: mtpOff)
+        for l in pleLayers {
+            guard let ple = arraysByName["pleConv_\(l)"],
+                  ple.shape == state.expectedPLEShape, ple.dtype == .bfloat16
+            else {
+                log("load failed: depth=\(depth) key=\(key.prefix(12)) bad PLE array for layer \(l)")
+                return false
+            }
+        }
+        for l in kvLayers {
+            guard let k = arraysByName["kv_k_\(l)"],
+                  let v = arraysByName["kv_v_\(l)"],
+                  k.ndim == 4, v.ndim == 4,
+                  k.shape == [1, state.expectedKVHeads, deltaCount, state.expectedKVHeadDim],
+                  v.shape == k.shape, k.dtype == .bfloat16, v.dtype == .bfloat16
+            else {
+                log("load failed: depth=\(depth) key=\(key.prefix(12)) bad KV delta for layer \(l)")
+                return false
+            }
+        }
+        for l in indexerLayers {
+            guard let b = arraysByName["indexer_\(l)"],
+                  b.shape == [1, deltaCount, state.expectedIndexerDim],
+                  b.dtype == .bfloat16
+            else {
+                log("load failed: depth=\(depth) key=\(key.prefix(12)) bad indexer delta for layer \(l)")
+                return false
             }
         }
 
+        let mtpPresent = meta["mtpPresent"] as? Bool ?? false
+        let mtpStart = meta["mtpStart"] as? Int ?? 0
+        let mtpEnd = meta["mtpEnd"] as? Int ?? 0
+        if mtpPresent {
+            guard mtpStart == (state.mtp?.offset ?? 0), mtpEnd >= mtpStart,
+                  let k = arraysByName["mtp_kv_k"],
+                  let v = arraysByName["mtp_kv_v"],
+                  let b = arraysByName["mtp_indexer"],
+                  k.ndim == 4, v.ndim == 4, b.ndim == 3,
+                  k.shape == [1, state.expectedKVHeads,
+                              mtpEnd - mtpStart, state.expectedKVHeadDim],
+                  v.shape == k.shape,
+                  b.shape == [1, mtpEnd - mtpStart, state.expectedIndexerDim],
+                  k.dtype == .bfloat16, v.dtype == .bfloat16,
+                  b.dtype == .bfloat16,
+                  arraysByName["lastMulti"] != nil
+            else {
+                log("load failed: depth=\(depth) key=\(key.prefix(12)) invalid MTP delta")
+                return false
+            }
+        } else if state.mtp != nil
+            || arraysByName["mtp_kv_k"] != nil
+            || arraysByName["mtp_kv_v"] != nil
+            || arraysByName["mtp_indexer"] != nil
+        {
+            log("load failed: depth=\(depth) key=\(key.prefix(12)) mixed MTP chain")
+            return false
+        }
+
+        for l in linearLayers {
+            state.linear[l]?.convState = arraysByName["conv_\(l)"]
+            state.linear[l]?.ssmState = arraysByName["ssm_\(l)"]
+            state.linear[l]?.pleConvState = arraysByName["pleConv_\(l)"]
+        }
+        for l in kvLayers {
+            guard state.kv[l]!.append(
+                keys: arraysByName["kv_k_\(l)"]!,
+                values: arraysByName["kv_v_\(l)"]!)
+            else { return false }
+        }
+        for l in indexerLayers {
+            guard state.indexer[l]!.append(arraysByName["indexer_\(l)"]!) else { return false }
+        }
+        if mtpPresent {
+            if state.mtp == nil { state.mtp = MTPState() }
+            guard state.mtp!.kv.append(
+                keys: arraysByName["mtp_kv_k"]!, values: arraysByName["mtp_kv_v"]!),
+                  state.mtp!.indexer.append(arraysByName["mtp_indexer"]!),
+                  state.mtp!.offset == mtpEnd
+            else { return false }
+        }
+        let ngram: [Int64]
+        if let saved = meta["ngramCtx"] as? [Int64] { ngram = saved }
+        else if let saved = meta["ngramCtx"] as? [Int] { ngram = saved.map { Int64($0) } }
+        else {
+            log("load failed: depth=\(depth) key=\(key.prefix(12)) ngram context missing")
+            return false
+        }
+        guard ngram.count == state.ngramCtx.count else {
+            log("load failed: depth=\(depth) key=\(key.prefix(12)) bad ngram context")
+            return false
+        }
+        state.ngramCtx = ngram
+        state.tokenCount = tokenCount
+        state.lastMulti = arraysByName["lastMulti"]
+
+        var materialize = Array(arraysByName.values)
+        for cache in state.kv.values {
+            if let k = cache.keys { materialize.append(k) }
+            if let v = cache.values { materialize.append(v) }
+        }
+        for cache in state.indexer.values {
+            if let b = cache.snapshot() { materialize.append(b) }
+        }
+        if let mtp = state.mtp {
+            if let k = mtp.kv.keys { materialize.append(k) }
+            if let v = mtp.kv.values { materialize.append(v) }
+            if let b = mtp.indexer.snapshot() { materialize.append(b) }
+        }
+        eval(materialize)
         ChunkIndex.shared.touch(key: key)
-        log("load done: \(tokenIds.count) tokens depth=\(depth) key=\(key.prefix(12))")
-        return state
+        accepted = true
+        return true
     }
 
     // MARK: - utilities
+
+    private static func cacheFileVersion(at url: URL) -> Int? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        guard let data = try? handle.read(upToCount: 4096),
+              let nlIndex = data.firstIndex(of: 0x0a),
+              let meta = try? JSONSerialization.jsonObject(
+                with: data[0..<nlIndex]) as? [String: Any]
+        else { return nil }
+        return meta["version"] as? Int
+    }
 
     private static func directorySize(at url: URL) -> Int {
         let fm = FileManager.default

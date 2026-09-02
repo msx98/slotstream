@@ -29,6 +29,13 @@ public final class Qwen4ExpModel {
         var linear: [Int: LinearCache] = [:]
         var kv: [Int: KVCache] = [:]
         var indexer: [Int: IndexerCache] = [:]
+        var expectedPLELayers: Set<Int> = []
+        var expectedConvShape: [Int] = []
+        var expectedSSMShape: [Int] = []
+        var expectedPLEShape: [Int] = []
+        var expectedKVHeads = 0
+        var expectedKVHeadDim = 0
+        var expectedIndexerDim = 0
         var ngramCtx: [Int64] = []
         public var tokenCount = 0
         /// Speculative-decode companions, created lazily by the MTP-aware
@@ -68,6 +75,24 @@ public final class Qwen4ExpModel {
                 out["conv_\(l)"] = name(c.convState?.dtype)
                 out["ssm_\(l)"] = name(c.ssmState?.dtype)
                 out["pleConv_\(l)"] = name(c.pleConvState?.dtype)
+            }
+            return out
+        }
+
+        public func mtpDebug() -> [String: [Float]] {
+            guard let mtp else { return [:] }
+            var out: [String: [Float]] = [:]
+            if let k = mtp.kv.keys {
+                out["k"] = k[0..., 0..., 0 ..< mtp.offset, 0...]
+                    .asType(.float32).asArray(Float.self)
+            }
+            if let v = mtp.kv.values {
+                out["v"] = v[0..., 0..., 0 ..< mtp.offset, 0...]
+                    .asType(.float32).asArray(Float.self)
+            }
+            if let b = mtp.indexer.snapshot() {
+                out["indexer"] = b[0..., 0 ..< mtp.offset, 0...]
+                    .asType(.float32).asArray(Float.self)
             }
             return out
         }
@@ -162,6 +187,19 @@ public final class Qwen4ExpModel {
 
     public func makeState() -> State {
         let s = State()
+        s.expectedPLELayers = Set(ple.keys)
+        s.expectedConvShape = [
+            1, cfg.convKernel - 1,
+            2 * cfg.linearNumKHeads * cfg.linearKHeadDim
+                + cfg.linearNumVHeads * cfg.linearVHeadDim]
+        s.expectedSSMShape = [
+            1, cfg.linearNumVHeads, cfg.linearVHeadDim, cfg.linearKHeadDim]
+        s.expectedPLEShape = [
+            1, (cfg.pleConvKernel - 1) * cfg.ngramSize,
+            cfg.hcCount * cfg.hiddenSize]
+        s.expectedKVHeads = cfg.numKVHeads
+        s.expectedKVHeadDim = cfg.headDim
+        s.expectedIndexerDim = cfg.indexerKVHeads * cfg.indexerHeadDim
         s.ngramCtx = Array(repeating: Int64(cfg.eosTokenId), count: cfg.ngramSize - 1)
         for l in 0 ..< runLayers {
             if cfg.layerTypes[l] == "linear_attention" {
@@ -315,6 +353,8 @@ public struct StateCheckpoint {
     var conv: [Int: MLXArray]
     var ssm: [Int: MLXArray]
     var pleConv: [Int: MLXArray]
+    var kv: [Int: (keys: MLXArray, values: MLXArray)]
+    var indexer: [Int: MLXArray]
     var kvOffsets: [Int: Int]
     var indexerOffsets: [Int: Int]
     var ngramCtx: [Int64]
@@ -323,6 +363,8 @@ public struct StateCheckpoint {
     var lastMulti: MLXArray?
     var mtpKV: (MLXArray, MLXArray)?
     var mtpIndexer: MLXArray?
+
+    var linearLayers: [Int] { conv.keys.sorted() }
 }
 
 extension Qwen4ExpModel.State {
@@ -330,10 +372,18 @@ extension Qwen4ExpModel.State {
         var conv: [Int: MLXArray] = [:]
         var ssm: [Int: MLXArray] = [:]
         var pleConv: [Int: MLXArray] = [:]
+        var kvArrays: [Int: (keys: MLXArray, values: MLXArray)] = [:]
+        var indexerArrays: [Int: MLXArray] = [:]
         for (l, c) in linear {
             if let a = c.convState { conv[l] = a }
             if let a = c.ssmState { ssm[l] = a }
             if let a = c.pleConvState { pleConv[l] = a }
+        }
+        for (l, c) in kv {
+            if let k = c.keys, let v = c.values { kvArrays[l] = (k, v) }
+        }
+        for (l, c) in indexer {
+            if let b = c.snapshot() { indexerArrays[l] = b }
         }
         // MTP draft head KV/indexer carry the same persistent-state role as
         // the main model's caches: their offsets are derived from the
@@ -346,6 +396,7 @@ extension Qwen4ExpModel.State {
         }
         return StateCheckpoint(
             conv: conv, ssm: ssm, pleConv: pleConv,
+            kv: kvArrays, indexer: indexerArrays,
             kvOffsets: kv.mapValues { $0.offset },
             indexerOffsets: indexer.mapValues { $0.offset },
             ngramCtx: ngramCtx, tokenCount: tokenCount,

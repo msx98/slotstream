@@ -1,15 +1,16 @@
 // Chunk index for the disk-persisted prefix KV cache.
 //
-// One chunk = one prefix of the prompt at a `prefillChunk` boundary (default
-// 4096 tokens). Chunks are chained by parent: chunk N's key is
+// One node = one chunk's append-only attention state plus the recurrent state
+// at that `prefillChunk` boundary (default 4096 tokens). Nodes are chained by
+// parent: chunk N's key is
 // `sha256(parent_sha || sha256(chunk_embeddings))`, so two conversations
 // that share the first 4096 tokens but diverge at position 4097 get two
 // distinct keys at depth 1 and never alias.
 //
 // On disk, each chunk lives at `kvcache_dir/<key>/` with three files:
-//   - `data.kv` — the saved state arrays (KVCache/Indexer/LinearCache/Multi/MTP)
-//   - `parent_sha.bin` — 32 bytes, the parent chunk's key (or empty if depth 0)
-//   - `emb_sha.bin` — 32 bytes, the sha256 of the chunk's embeddings
+//   - `data.kv` — the chunk delta plus endpoint recurrent state
+//   - `parent_sha.bin` — parent key as hex UTF-8 (or empty at the root)
+//   - `emb_sha.bin` — embedding hash as hex UTF-8
 //
 // The metadata DB (SQLite, journal_mode=WAL) holds:
 //   - last_used: timestamp of most recent save or load

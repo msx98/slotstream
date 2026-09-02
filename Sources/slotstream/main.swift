@@ -1479,8 +1479,8 @@ struct Heat: ParsableCommand {
 ///      (a single `hiddenStatesWithMulti` call).
 ///   2. Re-build it in 128-token chunks the way the serve path does, saving
 ///      each chunk-aligned prefix to disk through `DiskCache.saveAsync`.
-///   3. After flushing the save queue, wipe the in-memory state and walk the
-///      parent-chained chain on disk via `longestPrefixHit`/`loadState`.
+///   3. After flushing the save queue, wipe the in-memory state and serially
+///      apply the fixed-size parent-chained nodes from disk.
 ///   4. Compare the three results element-wise.
 ///
 /// The point is that the SAME math, chunked differently, must round-trip
@@ -1541,6 +1541,7 @@ struct KVRoundtripCheck: ParsableCommand {
                     let engine = try await Engine(modelDir: model.modelURL, plan: plan)
                     m = engine.model
                 }
+                if plan.mtpEnabled { try m.enableMTP(modelDir: model.modelURL) }
 
                 // Deterministic token sequence — vocab-sized primes so the same
                 // inputs hit the same expert routes, and so a config drift
@@ -1593,11 +1594,20 @@ struct KVRoundtripCheck: ParsableCommand {
                 var cliMulti: [Float] = []
                 var cliBoundary: [String: [Float]] = [:]
                 var cliBoundaryStrides: [String: [Int]] = [:]
+                var cliBoundaryMTP: [String: [Float]] = [:]
                 var cliBoundaryState: Qwen4ExpModel.State? = nil
                 while i < N {
                     let hi = min(i + C, N)
                     let chunkIds = Array(ids[i..<hi])
                     let (mixedChunk, mtp) = m.hiddenStatesWithMulti(chunkIds, state: cliState)
+                    if let head = m.mtpHead {
+                        if cliState.mtp == nil { cliState.mtp = MTPState() }
+                        cliState.lastMulti = head.consume(
+                            chunk: chunkIds, chunkMulti: mtp,
+                            prevMulti: cliState.lastMulti,
+                            resident: m.resident, rope: m.sharedRope,
+                            state: cliState.mtp!)
+                    }
                     if hi == N {
                         cliMulti = vec(mtp)
                         FileHandle.standardError.write(
@@ -1640,12 +1650,13 @@ struct KVRoundtripCheck: ParsableCommand {
                         DiskCache.saveAsync(
                             state: cliState, tokenIds: Array(ids[0..<hi]),
                             key: key, parentSha: parentSha, depth: depth,
-                            embeddings: chunkEmbeds)
+                            embeddings: chunkEmbeds, parentTokenCount: chunkLo)
                         // Snapshot the live state at this boundary so the load
                         // step can diff the restored arrays against it BEFORE
                         // the last chunk runs.
                         cliBoundary = cliState.linearDebug()
                         cliBoundaryStrides = cliState.linearStrides()
+                        cliBoundaryMTP = cliState.mtpDebug()
                         // Build a ref-copy state of cliState (no disk). If a
                         // ref-copied state + chunk 4 matches cliState's
                         // chunk 4, the divergence is the disk round trip.
@@ -1666,7 +1677,7 @@ struct KVRoundtripCheck: ParsableCommand {
                     FileManager.default.fileExists(
                         atPath: $0.appendingPathComponent("data.kv").path)
                 }
-                let expectedChunks = N / C - 1  // 4 for 512/128; the final token-set has no saved chunk
+                let expectedChunks = N / C - 1  // The final token set has no saved chunk.
                 if chunkDirs.count != expectedChunks {
                     FileHandle.standardError.write(
                         ("FAIL  expected \(expectedChunks) chunks on disk, found \(chunkDirs.count)\n").data(using: .utf8)!)
@@ -1676,6 +1687,28 @@ struct KVRoundtripCheck: ParsableCommand {
                 }
                 FileHandle.standardError.write(
                     ("PASS  \(chunkDirs.count) chunks on disk at \(kvDir.path)\n").data(using: .utf8)!)
+
+                var nodeSizes: [Int] = []
+                for dir in chunkDirs {
+                    let dataURL = dir.appendingPathComponent("data.kv")
+                    let data = try Data(contentsOf: dataURL, options: .mappedIfSafe)
+                    guard let nl = data.firstIndex(of: 0x0a),
+                          let meta = try JSONSerialization.jsonObject(
+                            with: data[0..<nl]) as? [String: Any],
+                          meta["version"] as? Int == 4
+                    else {
+                        throw ModelError("disk node is not format version 4")
+                    }
+                    nodeSizes.append(data.count)
+                }
+                if let smallest = nodeSizes.min(), let largest = nodeSizes.max(),
+                   largest - smallest > 1_000_000
+                {
+                    throw ModelError(
+                        "disk nodes are not fixed-size: min \(smallest), max \(largest)")
+                }
+                FileHandle.standardError.write(
+                    "PASS  disk node sizes are depth-independent\n".data(using: .utf8)!)
 
                 // 4. Cold-load: a fresh State, no in-memory state carried over.
                 let embed: (Int) -> [Float]? = { d in
@@ -1718,6 +1751,19 @@ struct KVRoundtripCheck: ParsableCommand {
                     result = .failure(ExitCode(2))
                     sem.signal()
                     return
+                }
+                if plan.mtpEnabled,
+                   restored.mtp?.offset != max(0, restored.tokenCount - 1)
+                {
+                    throw ModelError("restored MTP cache is not aligned to the prefix")
+                }
+                if plan.mtpEnabled {
+                    let restoredMTP = restored.mtpDebug()
+                    for name in ["k", "v", "indexer"] {
+                        guard cliBoundaryMTP[name] == restoredMTP[name] else {
+                            throw ModelError("restored MTP \(name) differs at the saved boundary")
+                        }
+                    }
                 }
                 // Fidelity gate: the restored arrays must equal the live
                 // arrays captured at the 48-token save boundary, BEFORE any
@@ -1762,6 +1808,24 @@ struct KVRoundtripCheck: ParsableCommand {
                 // comparable to the one-pass and chunked builds.
                 let (_, restoredLast) = m.hiddenStatesWithMulti(
                     Array(ids[hitLen..<N]), state: restored)
+                if let head = m.mtpHead {
+                    if restored.mtp == nil { restored.mtp = MTPState() }
+                    restored.lastMulti = head.consume(
+                        chunk: Array(ids[hitLen..<N]), chunkMulti: restoredLast,
+                        prevMulti: restored.lastMulti,
+                        resident: m.resident, rope: m.sharedRope,
+                        state: restored.mtp!)
+                    guard restored.mtp!.offset == N - 1 else {
+                        throw ModelError("continued MTP cache is not aligned")
+                    }
+                    let cliMTP = cliState.mtpDebug()
+                    let restoredMTP = restored.mtpDebug()
+                    for name in ["k", "v", "indexer"] {
+                        guard cliMTP[name] == restoredMTP[name] else {
+                            throw ModelError("continued MTP \(name) differs after disk restore")
+                        }
+                    }
+                }
                 let restoredMulti = vec(restoredLast)
                 FileHandle.standardError.write(
                     "  debug  restored multi shape: \(restoredLast.shape)\n".data(using: .utf8)!)
