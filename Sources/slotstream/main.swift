@@ -142,6 +142,41 @@ struct RuntimeCheck: ParsableCommand {
         check("a smaller live token ceiling evicts immediately", cache.heldTokens <= 2)
         check("held GB includes fixed recurrent state", cache.heldGB > 0.1)
 
+        // Disk quota enforcement (the --kv-cache-size path), weights-free:
+        // a fake leaf with a v4 data.kv and an index row must leave the DB
+        // AND the disk when a smaller quota forces eviction, and lookup must
+        // not resurrect it through the unindexed-but-on-disk heal path.
+        let kvDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "slotstream-runtimecheck-kv-\(Int(Date().timeIntervalSince1970 * 1000))",
+                isDirectory: true)
+        try? FileManager.default.createDirectory(
+            at: kvDir, withIntermediateDirectories: true)
+        DiskCache.dirOverride = kvDir.path
+        defer {
+            try? FileManager.default.removeItem(at: kvDir)
+            DiskCache.dirOverride = nil
+            DiskCache.maxBytesOverride = nil
+        }
+        let emb: [Float] = [0.5, -0.25, 1.0, 0.125]
+        let key = ChunkIndex.makeKey(parentSha: nil, embeddings: emb)
+        let chunkDir = kvDir.appendingPathComponent(key, isDirectory: true)
+        try? FileManager.default.createDirectory(at: chunkDir, withIntermediateDirectories: true)
+        try? Data("{\"version\":4}\n".utf8).write(
+            to: chunkDir.appendingPathComponent("data.kv"))
+        ChunkIndex.shared.register(
+            key: key, parentSha: nil, depth: 0,
+            parentTokenCount: 0, tokenCount: 128, sizeBytes: 1_000_000)
+        DiskCache.maxBytesOverride = 1e-6  // ~1 KB: the 1 MB chunk is over quota
+        let freed = DiskCache.enforceQuota()
+        check("forced eviction frees an over-quota leaf", freed >= 1_000_000)
+        check("an evicted leaf's directory leaves the disk",
+              !FileManager.default.fileExists(
+                atPath: chunkDir.appendingPathComponent("data.kv").path))
+        let resurrected = DiskCache.longestPrefixHit(chunk: 128, embed: { d in d == 0 ? emb : nil })
+        check("lookup does not resurrect an evicted chunk", resurrected == nil)
+        DiskCache.maxBytesOverride = nil
+
         for target in [Planner.minMemoryGB, 10, 16, 30] where target >= Planner.minMemoryGB {
             let p = try Planner.plan(
                 expertsPerLayer: nil, poolGB: nil, memoryGB: target,
@@ -234,6 +269,22 @@ struct ModelOptions: ParsableArguments {
                 """))
     var kvStoreDir: String?
 
+    @Option(
+        name: .customLong("kv-cache-size"),
+        help: ArgumentHelp(
+            "On-disk prefix KV cache quota, in GB (default 20).",
+            discussion: """
+                Sets the quota for this run — overriding \
+                SLOTSTREAM_KVCACHE_MAX_GB — and immediately evicts the \
+                least valuable leaf chunks until the store fits, before the \
+                model loads. Same policy the save path applies: chunks are \
+                valued by the newest use anywhere in their subtree, so a \
+                parent with live children is protected, and only leaves are \
+                ever dropped. Values below one chunk's footprint make the \
+                disk tier ineffective.
+                """))
+    var kvCacheSizeGB: Double?
+
     var modelURL: URL { ModelLocator.resolve(model) }
 
     func mtpMode() throws -> Planner.MTPMode {
@@ -246,11 +297,27 @@ struct ModelOptions: ParsableArguments {
     /// Resolve knobs -> plan, print the announce, return it. Also the first
     /// place a stranger hits with no weights — offer the download right there.
     func announcedPlan() throws -> MemoryPlan {
+        if let gb = kvCacheSizeGB, gb <= 0 {
+            throw PlanError("--kv-cache-size must be greater than 0 (got \(gb))")
+        }
         try ensureWeights()
         // Apply explicit --kv-store-dir before any code reads DiskCache.dir.
         // The env-var path is the fallback inside DiskCache.dir itself.
         if let d = kvStoreDir, !d.isEmpty {
             DiskCache.dirOverride = d
+        }
+        // --kv-cache-size sets the quota and forces the store under it right
+        // here, before the model loads and before anything can save.
+        if let gb = kvCacheSizeGB {
+            DiskCache.maxBytesOverride = gb
+            let freed = DiskCache.enforceQuota()
+            let total = ChunkIndex.shared.totalBytes()
+            let note = freed > 0
+                ? String(format: ", evicted %.2f GB leaf-first", Double(freed) / 1e9)
+                : ", already under quota"
+            FileHandle.standardError.write(
+                Data(String(format: "kv-cache-size %.1f GB: store is %.2f GB%@\n",
+                            gb, Double(total) / 1e9, note).utf8))
         }
         let plan = try Planner.plan(
             expertsPerLayer: expertsPerLayer, poolGB: poolGB, memoryGB: memoryGB,
@@ -412,6 +479,9 @@ struct Serve: ParsableCommand {
     @Flag(name: .customLong("no-prefix-cache"),
           help: "Re-prefill every request from scratch. Default: the state of one request is reused by the next when that request's prompt extends it, so a chat turn only prefills what is new.")
     var noPrefixCache = false
+    @Option(name: .customLong("output"),
+            help: "Append raw model I/O as JSONL, best-effort: one \"request\" line per POST body verbatim (before any parsing, validation, or templating), one \"delta\" line per decoded text piece with its token id as the model emits it, and one \"response\" line with the assembled raw text. Lines of one exchange share an id. Without this flag nothing is accumulated and generation runs exactly as before.")
+    var outputPath: String?
 
     func run() throws {
         guard maxContext > 0, maxContext <= SampleParams.maxTokenCeiling else {
@@ -450,7 +520,7 @@ struct Serve: ParsableCommand {
         defer { governor?.stop() }
         let server = Server(
             engine: engine, port: port, weightsBytes: Int(PinnedModel.totalBytes),
-            listenFD: listenFD)
+            listenFD: listenFD, outputPath: outputPath)
         try server.run()
     }
 }

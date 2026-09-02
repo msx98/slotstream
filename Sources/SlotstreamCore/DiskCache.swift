@@ -28,6 +28,11 @@ public enum DiskCache {
     /// is hermetic. Reads from `DiskCache.dir` everywhere, so it just has
     /// to be set before any chunk is touched.
     public static var dirOverride: String?
+    /// Explicit process-global quota override, in GB. Set by the CLI's
+    /// --kv-cache-size; takes precedence over SLOTSTREAM_KVCACHE_MAX_GB so a
+    /// single invocation is hermetic. Must be set before the first save or
+    /// enforcement (the CLI applies it in announcedPlan, before the model).
+    public static var maxBytesOverride: Double?
     static var dir: URL {
         if let o = dirOverride, !o.isEmpty {
             return URL(fileURLWithPath: o)
@@ -38,11 +43,31 @@ public enum DiskCache {
         return FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".slotstream/kvcache", isDirectory: true)
     }
-    /// Default on-disk quota. Old entries beyond this are evicted leaf-first.
+    /// On-disk quota. Old entries beyond this are evicted leaf-first.
     static var maxBytes: Int {
-        let envGB = ProcessInfo.processInfo.environment["SLOTSTREAM_KVCACHE_MAX_GB"]
-            .flatMap { Double($0) } ?? 20.0
-        return Int(envGB * 1_073_741_824.0)
+        let gb = maxBytesOverride
+            ?? ProcessInfo.processInfo.environment["SLOTSTREAM_KVCACHE_MAX_GB"]
+                .flatMap { Double($0) }
+            ?? 20.0
+        return Int(gb * 1_073_741_824.0)
+    }
+
+    /// Force the on-disk cache under its quota with the existing eviction
+    /// policy (`ChunkIndex.evictLeaves`): least recently valuable subtrees
+    /// first, leaves only, so a parent with live children is protected.
+    /// No-op while under quota. Returns bytes freed. Runs at startup when
+    /// --kv-cache-size is given, and after every save.
+    @discardableResult
+    public static func enforceQuota() -> Int {
+        let max = maxBytes
+        let total = ChunkIndex.shared.totalBytes()
+        guard total > max else { return 0 }
+        let freed = ChunkIndex.shared.evictLeaves(bytesNeeded: total - max, maxBytes: max)
+        if freed > 0 {
+            sweepOrphans()
+            log("evicted \(freed) bytes, now \(ChunkIndex.shared.totalBytes()) bytes on disk")
+        }
+        return freed
     }
 
     /// Serial queue so chunk saves during one prefill (4096, 8192, 12288...)
@@ -268,17 +293,7 @@ public enum DiskCache {
                     sizeBytes: dirSize)
 
                 // Eviction: if over quota, drop leaves until under quota.
-                let total = ChunkIndex.shared.totalBytes()
-                if total > maxBytes {
-                    let freed = ChunkIndex.shared.evictLeaves(
-                        bytesNeeded: total - maxBytes, maxBytes: maxBytes)
-                    if freed > 0 {
-                        // Sweep directories the index no longer knows about
-                        // (orphaned from earlier crashes or manual deletes).
-                        sweepOrphans()
-                        log("evicted \(freed) bytes, now \(ChunkIndex.shared.totalBytes()) bytes on disk")
-                    }
-                }
+                enforceQuota()
 
                 log("save done: \(tokenIds.count) tokens depth=\(depth) key=\(key.prefix(12)) "
                     + "\(String(format: "%.1f", Double(dirSize) / 1e6)) MB in "
@@ -692,9 +707,14 @@ public enum DiskCache {
         return total
     }
 
-    /// Remove chunk directories whose key is no longer in the index. Called
-    /// after eviction so a stale process can't be tripped up by the disk
-    /// outlasting the DB.
+    /// Remove chunk directories whose key is no longer in the index — the
+    /// leaves evictLeaves dropped (it deletes DB rows only; this is where the
+    /// directory actually leaves the disk) — and directories that can never
+    /// load (no data.kv: crash leftovers, legacy layouts). Called after
+    /// eviction so a stale process can't be tripped up by the disk outlasting
+    /// the DB. This also bounds the lookup-heal window: an unindexed data.kv
+/// would otherwise be re-registered by longestPrefixHit and resurrect a
+/// chunk the eviction deliberately chose to drop.
     private static func sweepOrphans() {
         let fm = FileManager.default
         guard let entries = try? fm.contentsOfDirectory(
@@ -703,7 +723,8 @@ public enum DiskCache {
             guard (try? entry.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
             else { continue }
             let dataPath = entry.appendingPathComponent("data.kv")
-            if !fm.fileExists(atPath: dataPath.path) {
+            if !ChunkIndex.shared.contains(key: entry.lastPathComponent)
+                || !fm.fileExists(atPath: dataPath.path) {
                 try? fm.removeItem(at: entry)
             }
         }

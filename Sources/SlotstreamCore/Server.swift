@@ -19,12 +19,22 @@ public final class Server {
     /// than a second hand-maintained copy of the number.
     let weightsBytes: Int
     var listenFD: Int32 = -1
+    /// When set, every generation appends one JSON line here with the raw
+    /// prompt and the raw model response, before any processing.
+    let outputPath: String?
+    private let outputQueue = DispatchQueue(label: "slotstream.rawlog")
+    /// Touched only from `outputQueue`.
+    private var outputFile: FileHandle?
 
-    public init(engine: Engine, port: UInt16, weightsBytes: Int = 0, listenFD: Int32 = -1) {
+    public init(
+        engine: Engine, port: UInt16, weightsBytes: Int = 0, listenFD: Int32 = -1,
+        outputPath: String? = nil
+    ) {
         self.engine = engine
         self.port = port
         self.weightsBytes = weightsBytes
         self.listenFD = listenFD
+        self.outputPath = outputPath
     }
 
     /// Claim the port. Callers bind *before* loading the model so "address
@@ -222,6 +232,16 @@ public final class Server {
     private func handle(_ fd: Int32) {
         defer { close(fd) }
         guard let req = readRequest(fd) else { return }
+        // Raw log: the request body exactly as received, before any parsing,
+        // validation, or templating. Only when --output was given.
+        var logId = ""
+        if outputPath != nil, !req.body.isEmpty {
+            logId = "req-\(UUID().uuidString.prefix(8))"
+            logRequest(
+                id: logId, method: req.method, path: req.path,
+                body: String(data: req.body, encoding: .utf8)
+                    ?? "<non-utf8 \(req.body.count) bytes>")
+        }
         let origin = req.headers["origin"]
         guard let cors = Self.corsHeaders(origin: origin) else {
             respondJSON(
@@ -298,11 +318,11 @@ public final class Server {
                     ],
                 ], cors: cors)
         case ("POST", "/api/chat"):
-            apiChat(fd, json, cors: cors)
+            apiChat(fd, json, cors: cors, logId: logId)
         case ("POST", "/api/generate"):
-            apiGenerate(fd, json, cors: cors)
+            apiGenerate(fd, json, cors: cors, logId: logId)
         case ("POST", "/v1/chat/completions"):
-            v1Chat(fd, json, cors: cors)
+            v1Chat(fd, json, cors: cors, logId: logId)
         case ("GET", "/v1/models"):
             respondJSON(
                 fd,
@@ -365,6 +385,60 @@ public final class Server {
 
     private func iso(_ d: Date) -> String {
         ISO8601DateFormatter().string(from: d)
+    }
+
+    // MARK: raw request/response log (--output)
+
+    /// Append one JSON line per event to the --output file:
+    ///   {"ts","id","kind":"request","method","path","body"}  — the raw POST body verbatim, before any parsing or validation
+    ///   {"ts","id","kind":"delta","seq","tok","text"}        — one per decoded text piece, as the model emits it
+    ///   {"ts","id","kind":"response","endpoint","response"}  — the assembled raw model text at the end of generation
+    /// The `id` associates a request with its deltas and response. Delta text
+    /// and the final response are the raw model output exactly as decoded —
+    /// before tool-call parsing, reasoning splitting, or any other
+    /// handler-level processing. Best-effort: a logging failure must never
+    /// fail the request being logged.
+    private func logRawLine(_ entry: [String: Any]) {
+        guard outputPath != nil else { return }
+        guard let line = try? JSONSerialization.data(withJSONObject: entry) else { return }
+        outputQueue.sync {
+            if outputFile == nil {
+                if let path = outputPath,
+                    !FileManager.default.fileExists(atPath: path)
+                {
+                    FileManager.default.createFile(atPath: path, contents: nil)
+                }
+                outputFile = outputPath.flatMap { try? FileHandle(forWritingTo: URL(fileURLWithPath: $0)) }
+            }
+            guard let fh = outputFile else { return }
+            fh.seekToEndOfFile()
+            fh.write(line)
+            fh.write(Data("\n".utf8))
+        }
+    }
+
+    func logRequest(id: String, method: String, path: String, body: String?) {
+        guard outputPath != nil else { return }
+        logRawLine([
+            "ts": iso(Date()), "id": id, "kind": "request",
+            "method": method, "path": path, "body": body as Any,
+        ])
+    }
+
+    func logDelta(id: String, seq: Int, tok: Int, text: String) {
+        guard outputPath != nil else { return }
+        logRawLine([
+            "ts": iso(Date()), "id": id, "kind": "delta",
+            "seq": seq, "tok": tok, "text": text,
+        ])
+    }
+
+    func logResponse(id: String, endpoint: String, response: String) {
+        guard outputPath != nil else { return }
+        logRawLine([
+            "ts": iso(Date()), "id": id, "kind": "response",
+            "endpoint": endpoint, "response": response,
+        ])
     }
 
     // MARK: params
@@ -605,6 +679,7 @@ public final class Server {
             "tools", "tool_choice", "parallel_tool_calls",
             "response_format", "n", "user", "logit_bias", "logprobs", "top_logprobs",
             "reasoning_effort", "verbosity",
+            "enable_thinking",
         ]
         if let e = Self.unsupportedKey(json, allowed: allowed) { return e }
         if let e = Self.openAIMessageError(json) { return e }
@@ -626,6 +701,18 @@ public final class Server {
         }
         if json["stream"] != nil, Self.bool(json["stream"]) == nil {
             return "stream must be true or false"
+        }
+        if json["enable_thinking"] != nil, Self.bool(json["enable_thinking"]) == nil {
+            return "enable_thinking must be true or false"
+        }
+        // Qwen's chat template only recognises xhigh/medium/low. Reject the
+        // OpenAI "high" level explicitly so a client mistake surfaces as a 400
+        // rather than a tokenizer exception mid-prefill.
+        if let r = json["reasoning_effort"] {
+            guard let s = r as? String else { return "reasoning_effort must be a string" }
+            if !["low", "medium", "xhigh"].contains(s) {
+                return "reasoning_effort must be one of: low, medium, xhigh"
+            }
         }
         if json["stream_options"] != nil,
             json["stream_options"] as? [String: Any] == nil
@@ -751,6 +838,37 @@ public final class Server {
         }
     }
 
+    /// Split a raw model response into (reasoning, content). With thinking on,
+    /// Qwen wraps its reasoning in `<think>...</think>`; with thinking off the
+    /// template closes the think block immediately (`<think>\n\n</think>`) and
+    /// the whole visible response is content. A tool-only reply may omit
+    /// `</think>` entirely — then the pre-tool prefix is reasoning.
+    private static func splitReasoning(
+        _ raw: String, thinking: Bool
+    ) -> (reasoning: String, content: String) {
+        if let r = raw.range(of: "</think>") {
+            let reasoning = String(raw[..<r.lowerBound])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let content = String(raw[r.upperBound...])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return (reasoning, content)
+        }
+        if raw.contains("<tool_call>") {
+            let prefix = String(raw[..<raw.range(of: "<tool_call>")!.lowerBound])
+            let rest = String(raw[raw.range(of: "<tool_call>")!.lowerBound...])
+            return (
+                prefix.trimmingCharacters(in: .whitespacesAndNewlines),
+                rest.trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+        }
+        // No think markers at all: with thinking off the response is plain
+        // content. With thinking on this is a truncated think block (token
+        // limit) — surfacing half-thoughts as the answer would be worse than
+        // reporting them as reasoning.
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return (thinking ? trimmed : "", thinking ? "" : trimmed)
+    }
+
     /// Parse <tool_call> XML produced by the Qwen template into OpenAI tool_calls.
     private static func parseToolCalls(from text: String, paramTypes: [String: [String: String]] = [:]) -> (content: String, calls: [[String: Any]]?) {
         // Model emits: <tool_call><function=NAME><parameter=ARG>VAL</parameter>...</function></tool_call>
@@ -835,7 +953,9 @@ public final class Server {
 
     // MARK: /api/chat
 
-    private func apiChat(_ fd: Int32, _ json: [String: Any], cors: String) {
+    private func apiChat(
+        _ fd: Int32, _ json: [String: Any], cors: String, logId: String
+    ) {
         if let e = ollamaValidationError(
             json, allowed: ["model", "messages", "stream", "think", "options"],
             messages: true)
@@ -871,7 +991,16 @@ public final class Server {
         let t0 = Date()
         if stream, !startChunked(fd, contentType: "application/x-ndjson", cors: cors) { return }
         var alive = true
-        let callback: ((Int, String) -> Bool)? = stream ? { _, delta in
+        // Delta logging exists only under --output; without it a non-streaming
+        // request passes no callback at all and nothing is accumulated.
+        let logDeltas = outputPath != nil
+        var deltaSeq = 0
+        let callback: ((Int, String) -> Bool)? = (stream || logDeltas) ? { tok, delta in
+            if logDeltas {
+                self.logDelta(id: logId, seq: deltaSeq, tok: tok, text: delta)
+                deltaSeq += 1
+            }
+            guard stream else { return true }
             guard alive, !delta.isEmpty else { return alive }
             let obj: [String: Any] = [
                 "model": self.engine.modelName, "created_at": self.iso(Date()),
@@ -884,6 +1013,7 @@ public final class Server {
         let (text, _, stats) = engine.generate(
             promptIds: ids, params: params, visionEmbeds: visionEmbeds,
             shouldContinue: { self.peerAlive(fd) }, onToken: callback)
+        if logDeltas { logResponse(id: logId, endpoint: "/api/chat", response: text) }
         let final: [String: Any] = [
             "model": engine.modelName, "created_at": iso(Date()),
             "message": ["role": "assistant", "content": stream ? "" : text],
@@ -904,7 +1034,9 @@ public final class Server {
 
     // MARK: /api/generate
 
-    private func apiGenerate(_ fd: Int32, _ json: [String: Any], cors: String) {
+    private func apiGenerate(
+        _ fd: Int32, _ json: [String: Any], cors: String, logId: String
+    ) {
         if let e = ollamaValidationError(
             json,
             allowed: ["model", "prompt", "system", "raw", "stream", "think", "options"])
@@ -973,7 +1105,14 @@ public final class Server {
         let t0 = Date()
         if stream, !startChunked(fd, contentType: "application/x-ndjson", cors: cors) { return }
         var alive = true
-        let callback: ((Int, String) -> Bool)? = stream ? { _, delta in
+        let logDeltas = outputPath != nil
+        var deltaSeq = 0
+        let callback: ((Int, String) -> Bool)? = (stream || logDeltas) ? { tok, delta in
+            if logDeltas {
+                self.logDelta(id: logId, seq: deltaSeq, tok: tok, text: delta)
+                deltaSeq += 1
+            }
+            guard stream else { return true }
             guard alive, !delta.isEmpty else { return alive }
             let obj: [String: Any] = [
                 "model": self.engine.modelName, "created_at": self.iso(Date()),
@@ -986,6 +1125,7 @@ public final class Server {
         let (text, _, stats) = engine.generate(
             promptIds: ids, params: params,
             shouldContinue: { self.peerAlive(fd) }, onToken: callback)
+        if logDeltas { logResponse(id: logId, endpoint: "/api/generate", response: text) }
         let final: [String: Any] = [
             "model": engine.modelName, "created_at": iso(Date()),
             "response": stream ? "" : text, "done": true, "done_reason": stats.finishReason,
@@ -1005,7 +1145,9 @@ public final class Server {
 
     // MARK: /v1/chat/completions (OpenAI, SSE streaming)
 
-    private func v1Chat(_ fd: Int32, _ json: [String: Any], cors: String) {
+    private func v1Chat(
+        _ fd: Int32, _ json: [String: Any], cors: String, logId: String
+    ) {
         if let e = openAIValidationError(json) {
             respondJSON(
                 fd, ["error": ["message": e, "type": "invalid_request_error"]],
@@ -1027,6 +1169,13 @@ public final class Server {
         params = params.sanitized()
         let wantUsage = Self.bool(
             (json["stream_options"] as? [String: Any])?["include_usage"]) ?? false
+        // Qwen's chat template defaults `enable_thinking` to true and reads
+        // `reasoning_effort` to tailor the system instruction. We mirror the
+        // template default so OpenAI clients (opencode) see reasoning_content
+        // deltas instead of silence; clients that want to skip thinking send
+        // `enable_thinking: false`.
+        let thinking = Self.bool(json["enable_thinking"]) ?? true
+        let reasoningEffort = json["reasoning_effort"] as? String
         let tmplMessages = Self.openAIMessagesForTemplate(json)
         let tmplTools = Self.openAITools(json)
         guard !tmplMessages.isEmpty else {
@@ -1038,7 +1187,9 @@ public final class Server {
         let ids: [Int]
         let visionEmbeds: MLXArray?
         do {
-            (ids, visionEmbeds) = try engine.encodeWithVision(messages: tmplMessages, tools: tmplTools, thinking: false)
+            (ids, visionEmbeds) = try engine.encodeWithVision(
+                messages: tmplMessages, tools: tmplTools,
+                thinking: thinking, reasoningEffort: reasoningEffort)
         } catch {
             respondJSON(fd, ["error": ["message": "\(error)"]], status: "400 Bad Request", cors: cors)
             return
@@ -1054,24 +1205,139 @@ public final class Server {
         let rid = "chatcmpl-\(UUID().uuidString.prefix(8))"
         if stream, !startChunked(fd, contentType: "text/event-stream", cors: cors) { return }
         var alive = true
+        // OpenAI streaming clients expect the assistant role to be announced
+        // before any delta arrives. Emit it once, immediately, so the client
+        // starts rendering the turn before the first token.
+        if stream, alive {
+            let open: [String: Any] = [
+                "id": rid, "object": "chat.completion.chunk",
+                "created": Int(Date().timeIntervalSince1970), "model": engine.modelName,
+                "choices": [["index": 0, "delta": ["role": "assistant"], "finish_reason": NSNull()]],
+            ]
+            alive = self.chunk(
+                fd, Data("data: ".utf8)
+                    + (try! JSONSerialization.data(withJSONObject: open))
+                    + Data("\n\n".utf8))
+        }
         // Translate Qwen <tool_call> XML to OpenAI tool_calls incrementally.
-        // The model emits XML; we parse complete blocks in the stream buffer
-        // and emit delta.tool_calls as soon as a block closes, while streaming
-        // only the prefix before the first block as content. This avoids leaking
-        // raw XML and avoids the post-hoc duplicate that required suppression.
+        // The model emits XML; we stream reasoning/content between tag
+        // boundaries, the tool_call header (id + name) the moment <function=NAME>
+        // opens, and the arguments JSON when </function></tool_call> closes.
+        // That way opencode sees "calling tool X..." as soon as the model commits
+        // to a tool, instead of waiting for every parameter to be filled in.
         var streamBuf = ""
         var reasoningSent = 0
         var contentSent = 0
-        var emittedToolCalls = 0
-        let toolPattern = "<tool_call>\\s*<function=([^>]+)>\\s*(.*?)\\s*</function>\\s*</tool_call>"
+        var toolHeadersEmitted = 0   // count of tool_calls headers streamed
+        // toolCalls state: idx -> (name, args dict, full block emitted?)
+        var toolState: [Int: (name: String, args: [String: Any], closed: Bool)] = [:]
+        let toolOpenRegex = try? NSRegularExpression(
+            pattern: "<tool_call>\\s*<function=([^>]+)>",
+            options: [])
+        let toolCloseRegex = try? NSRegularExpression(
+            pattern: "<tool_call>\\s*<function=([^>]+)>\\s*(.*?)\\s*</function>\\s*</tool_call>",
+            options: [.dotMatchesLineSeparators])
         let paramPattern = "<parameter=([^>]+)>\\s*(.*?)\\s*</parameter>"
+        let paramRegex = try? NSRegularExpression(pattern: paramPattern, options: [.dotMatchesLineSeparators])
         let paramTypes = Self.paramTypes(from: tmplTools)
-        let callback: ((Int, String) -> Bool)? = stream ? { _, delta in
+        let now = { Int(Date().timeIntervalSince1970) }
+        // When thinking is disabled, the model is told to skip reasoning and
+        // the response has no `<think>...</think>` wrapping. In that mode any
+        // pre-tool text is real content, not reasoning — stream it under
+        // `delta.content` instead of `delta.reasoning_content`.
+        let streamAsReasoning = thinking
+
+        func sse(_ obj: [String: Any]) -> Bool {
+            let data = try! JSONSerialization.data(withJSONObject: obj)
+            return self.chunk(fd, Data("data: ".utf8) + data + Data("\n\n".utf8))
+        }
+
+        /// Build the args dict for one tool_call block from its inner XML.
+        /// Returns the canonical sorted JSON string of those args.
+        func parseArgs(inner: String, name: String) -> String {
+            var args: [String: Any] = [:]
+            if let pr = paramRegex {
+                let innerNS = inner as NSString
+                let pMatches = pr.matches(
+                    in: inner, range: NSRange(location: 0, length: innerNS.length))
+                for pm in pMatches {
+                    let key = innerNS.substring(with: pm.range(at: 1))
+                    let rawVal = innerNS.substring(with: pm.range(at: 2))
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    if (rawVal.hasPrefix("{") && rawVal.hasSuffix("}"))
+                        || (rawVal.hasPrefix("[") && rawVal.hasSuffix("]"))
+                    {
+                        if let d = rawVal.data(using: .utf8),
+                            let obj = try? JSONSerialization.jsonObject(
+                                with: d, options: [.allowFragments])
+                        {
+                            args[key] = obj
+                            continue
+                        }
+                    }
+                    if rawVal == "true" { args[key] = true }
+                    else if rawVal == "false" { args[key] = false }
+                    else if rawVal == "null" { args[key] = NSNull() }
+                    else { args[key] = Self.coerceParam(rawVal, declared: paramTypes[name]?[key]) }
+                }
+            }
+            if let data = try? JSONSerialization.data(
+                withJSONObject: args, options: [.sortedKeys]),
+                let s = String(data: data, encoding: .utf8)
+            { return s }
+            return "{}"
+        }
+
+        let logDeltas = outputPath != nil
+        var deltaSeq = 0
+        let callback: ((Int, String) -> Bool)? = (stream || logDeltas) ? { tok, delta in
+            if logDeltas {
+                self.logDelta(id: logId, seq: deltaSeq, tok: tok, text: delta)
+                deltaSeq += 1
+            }
+            guard stream else { return true }
             guard alive, !delta.isEmpty else { return alive }
             streamBuf += delta
-            // Flush any newly received reasoning as delta.reasoning_content so
-            // clients (opencode) see progress during long thinking, not silence
-            // until the first </think> or tool tag closes.
+
+            // 1. Emit any newly opened tool_call headers as soon as we see
+            //    `<tool_call><function=NAME>` in the buffer.
+            if let regex = toolOpenRegex {
+                let ns = streamBuf as NSString
+                let opens = regex.matches(
+                    in: streamBuf, range: NSRange(location: 0, length: ns.length))
+                for idx in toolHeadersEmitted ..< opens.count {
+                    let m = opens[idx]
+                    let name = ns.substring(with: m.range(at: 1))
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    if toolState[idx] == nil {
+                        toolState[idx] = (name: name, args: [:], closed: false)
+                    }
+                    let obj: [String: Any] = [
+                        "id": rid, "object": "chat.completion.chunk",
+                        "created": now(), "model": self.engine.modelName,
+                        "choices": [[
+                            "index": 0,
+                            "delta": ["tool_calls": [[
+                                "index": idx,
+                                "id": "call_\(idx)",
+                                "type": "function",
+                                "function": ["name": name, "arguments": ""],
+                            ]]],
+                            "finish_reason": NSNull(),
+                        ]],
+                    ]
+                    alive = sse(obj)
+                    if !alive { return false }
+                    toolHeadersEmitted = idx + 1
+                }
+            }
+
+            // 2. Stream reasoning/content deltas. Anything between the start of
+            //    streamBuf and the first </think> or <tool_call> boundary is
+            //    reasoning when thinking is enabled, content when it isn't.
+            //    Anything after </think> is content. A tool-only reply (no
+            //    </think>) treats the prefix as reasoning/content per the
+            //    same flag.
             if let r = streamBuf.range(of: "</think>") {
                 let reasoning = String(streamBuf[..<r.lowerBound])
                 if reasoning.count > reasoningSent {
@@ -1079,17 +1345,15 @@ public final class Server {
                     if !toSend.isEmpty {
                         let obj: [String: Any] = [
                             "id": rid, "object": "chat.completion.chunk",
-                            "created": Int(Date().timeIntervalSince1970), "model": self.engine.modelName,
-                            "choices": [["index": 0, "delta": ["reasoning_content": toSend], "finish_reason": NSNull()]],
+                            "created": now(), "model": self.engine.modelName,
+                            "choices": [["index": 0,
+                                "delta": ["reasoning_content": toSend],
+                                "finish_reason": NSNull()]],
                         ]
-                        let data = try! JSONSerialization.data(withJSONObject: obj)
-                        alive = self.chunk(fd, Data("data: ".utf8) + data + Data("\n\n".utf8))
+                        alive = sse(obj)
                         reasoningSent = reasoning.count
                     }
                 }
-                // Anything after </think> (or before any tool tag in a tool-only reply)
-                // is real content; stream only the newly arrived tail bytes so clients
-                // don't see the same suffix duplicated on every delta.
                 let after = streamBuf.index(after: r.upperBound)
                 let tail = String(streamBuf[after...])
                 if tail.count > contentSent {
@@ -1097,126 +1361,143 @@ public final class Server {
                     if !toSend.isEmpty {
                         let obj: [String: Any] = [
                             "id": rid, "object": "chat.completion.chunk",
-                            "created": Int(Date().timeIntervalSince1970), "model": self.engine.modelName,
-                            "choices": [["index": 0, "delta": ["content": toSend], "finish_reason": NSNull()]],
+                            "created": now(), "model": self.engine.modelName,
+                            "choices": [["index": 0,
+                                "delta": ["content": toSend],
+                                "finish_reason": NSNull()]],
                         ]
-                        let data = try! JSONSerialization.data(withJSONObject: obj)
-                        alive = self.chunk(fd, Data("data: ".utf8) + data + Data("\n\n".utf8))
+                        alive = sse(obj)
                         contentSent = tail.count
                     }
                 }
             } else if let r = streamBuf.range(of: "<tool_call>") {
-                // Tool replies may not include </think>; stream the prefix as
-                // reasoning_content so it surfaces the same way.
                 let prefix = String(streamBuf[..<r.lowerBound])
-                if prefix.count > reasoningSent, !prefix.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                if prefix.count > reasoningSent
+                    && !prefix.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                {
                     let toSend = String(prefix.dropFirst(reasoningSent))
                     if !toSend.isEmpty {
+                        let key = streamAsReasoning ? "reasoning_content" : "content"
                         let obj: [String: Any] = [
                             "id": rid, "object": "chat.completion.chunk",
-                            "created": Int(Date().timeIntervalSince1970), "model": self.engine.modelName,
-                            "choices": [["index": 0, "delta": ["reasoning_content": toSend], "finish_reason": NSNull()]],
+                            "created": now(), "model": self.engine.modelName,
+                            "choices": [["index": 0,
+                                "delta": [key: toSend],
+                                "finish_reason": NSNull()]],
                         ]
-                        let data = try! JSONSerialization.data(withJSONObject: obj)
-                        alive = self.chunk(fd, Data("data: ".utf8) + data + Data("\n\n".utf8))
+                        alive = sse(obj)
                         reasoningSent = prefix.count
                     }
                 }
             } else {
+                let key = streamAsReasoning ? "reasoning_content" : "content"
                 let obj: [String: Any] = [
                     "id": rid, "object": "chat.completion.chunk",
-                    "created": Int(Date().timeIntervalSince1970), "model": self.engine.modelName,
-                    "choices": [["index": 0, "delta": ["reasoning_content": delta], "finish_reason": NSNull()]],
+                    "created": now(), "model": self.engine.modelName,
+                    "choices": [["index": 0,
+                        "delta": [key: delta],
+                        "finish_reason": NSNull()]],
                 ]
-                let data = try! JSONSerialization.data(withJSONObject: obj)
-                alive = self.chunk(fd, Data("data: ".utf8) + data + Data("\n\n".utf8))
+                alive = sse(obj)
                 reasoningSent += delta.count
                 return alive
             }
-            // Incremental tool_calls: emit each newly completed block.
-            guard let regex = try? NSRegularExpression(pattern: toolPattern, options: [.dotMatchesLineSeparators]) else { return alive }
+
+            // 3. For each newly completed <tool_call>...</tool_call> block,
+            //    emit the arguments JSON. The header was already streamed in
+            //    step 1, so this delta only contains `function.arguments`.
+            guard let regex = toolCloseRegex else { return alive }
             let ns = streamBuf as NSString
-            let matches = regex.matches(in: streamBuf, range: NSRange(location: 0, length: ns.length))
-            if matches.count > emittedToolCalls {
-                for idx in emittedToolCalls ..< matches.count {
-                    let m = matches[idx]
-                    let name = ns.substring(with: m.range(at: 1)).trimmingCharacters(in: .whitespacesAndNewlines)
-                    let inner = ns.substring(with: m.range(at: 2))
-                    var args: [String: Any] = [:]
-                    if let pr = try? NSRegularExpression(pattern: paramPattern, options: [.dotMatchesLineSeparators]) {
-                        let innerNS = inner as NSString
-                        let pMatches = pr.matches(in: inner, range: NSRange(location: 0, length: innerNS.length))
-                        for pm in pMatches {
-                            let key = innerNS.substring(with: pm.range(at: 1))
-                            let rawVal = innerNS.substring(with: pm.range(at: 2)).trimmingCharacters(in: .whitespacesAndNewlines)
-                            if (rawVal.hasPrefix("{") && rawVal.hasSuffix("}")) || (rawVal.hasPrefix("[") && rawVal.hasSuffix("]")) {
-                                if let d = rawVal.data(using: .utf8), let obj = try? JSONSerialization.jsonObject(with: d, options: [.allowFragments]) {
-                                    args[key] = obj
-                                    continue
-                                }
-                            }
-                            if rawVal == "true" { args[key] = true }
-                            else if rawVal == "false" { args[key] = false }
-                            else if rawVal == "null" { args[key] = NSNull() }
-                            else { args[key] = Self.coerceParam(rawVal, declared: paramTypes[name]?[key]) }
-                        }
-                    }
-                    let argsJSON: String
-                    if let data = try? JSONSerialization.data(withJSONObject: args, options: [.sortedKeys]), let s = String(data: data, encoding: .utf8) {
-                        argsJSON = s
-                    } else { argsJSON = "{}" }
-                    let deltaObj: [String: Any] = [
-                        "id": rid, "object": "chat.completion.chunk",
-                        "created": Int(Date().timeIntervalSince1970), "model": self.engine.modelName,
-                        "choices": [[
-                            "index": 0,
-                            "delta": ["tool_calls": [[
-                                "index": idx,
-                                "id": "call_\(idx)",
-                                "type": "function",
-                                "function": ["name": name, "arguments": argsJSON],
-                            ]]],
-                            "finish_reason": NSNull(),
-                        ]],
-                    ]
-                    let d = try! JSONSerialization.data(withJSONObject: deltaObj)
-                    alive = self.chunk(fd, Data("data: ".utf8) + d + Data("\n\n".utf8))
-                    if !alive { break }
-                }
-                emittedToolCalls = matches.count
+            let matches = regex.matches(
+                in: streamBuf, range: NSRange(location: 0, length: ns.length))
+            for idx in 0 ..< matches.count {
+                let m = matches[idx]
+                guard var st = toolState[idx], !st.closed else { continue }
+                let name = ns.substring(with: m.range(at: 1))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                let inner = ns.substring(with: m.range(at: 2))
+                let argsJSON = parseArgs(inner: inner, name: name)
+                let obj: [String: Any] = [
+                    "id": rid, "object": "chat.completion.chunk",
+                    "created": now(), "model": self.engine.modelName,
+                    "choices": [[
+                        "index": 0,
+                        "delta": ["tool_calls": [[
+                            "index": idx,
+                            "function": ["arguments": argsJSON],
+                        ]]],
+                        "finish_reason": NSNull(),
+                    ]],
+                ]
+                alive = sse(obj)
+                if !alive { return false }
+                st.closed = true
+                toolState[idx] = st
             }
             return alive
         } : nil
         let (rawText, _, stats) = engine.generate(
             promptIds: ids, params: params, visionEmbeds: visionEmbeds,
             shouldContinue: { self.peerAlive(fd) }, onToken: callback)
-        let parsed = Self.parseToolCalls(from: rawText, paramTypes: paramTypes)
+        if logDeltas { logResponse(id: logId, endpoint: "/v1/chat/completions", response: rawText) }
+        // Split reasoning from the visible response first, then parse tool
+        // calls out of the content part only — so reasoning text never leaks
+        // into parsed.content and vice versa.
+        let split = Self.splitReasoning(rawText, thinking: thinking)
+        let parsed = Self.parseToolCalls(from: split.content, paramTypes: paramTypes)
         let text: String = parsed.content
         let toolCalls = parsed.calls
         let finishReason: String = toolCalls != nil ? "tool_calls" : stats.finishReason
         if stream, alive {
             // Emit any tool_calls not already streamed incrementally (fallback for
-            // non-stream incremental edge where a block closed after the last callback).
-            if let calls = toolCalls, calls.count > emittedToolCalls {
-                for idx in emittedToolCalls ..< calls.count {
+            // a block whose `</function></tool_call>` closed after the last callback).
+            if let calls = toolCalls {
+                for idx in 0 ..< calls.count {
+                    guard toolState[idx] == nil else { continue }
                     let call = calls[idx]
-                    let deltaObj: [String: Any] = [
-                        "id": rid, "object": "chat.completion.chunk",
-                        "created": Int(Date().timeIntervalSince1970), "model": self.engine.modelName,
-                        "choices": [[
-                            "index": 0,
-                            "delta": ["tool_calls": [[
-                                "index": idx,
-                                "id": call["id"] as? String ?? "call_\(idx)",
-                                "type": "function",
-                                "function": call["function"] ?? [:],
-                            ]]],
-                            "finish_reason": NSNull(),
-                        ]],
-                    ]
-                    let d = try! JSONSerialization.data(withJSONObject: deltaObj)
-                    alive = self.chunk(fd, Data("data: ".utf8) + d + Data("\n\n".utf8))
-                    if !alive { break }
+                    // Header first (id + name), then arguments, so the delta
+                    // shape stays the same as the streaming path.
+                    if let fn = call["function"] as? [String: Any],
+                        let name = fn["name"] as? String
+                    {
+                        let head: [String: Any] = [
+                            "id": rid, "object": "chat.completion.chunk",
+                            "created": now(), "model": engine.modelName,
+                            "choices": [[
+                                "index": 0,
+                                "delta": ["tool_calls": [[
+                                    "index": idx,
+                                    "id": call["id"] as? String ?? "call_\(idx)",
+                                    "type": "function",
+                                    "function": ["name": name, "arguments": ""],
+                                ]]],
+                                "finish_reason": NSNull(),
+                            ]],
+                        ]
+                        alive = self.chunk(
+                            fd, Data("data: ".utf8)
+                                + (try! JSONSerialization.data(withJSONObject: head))
+                                + Data("\n\n".utf8))
+                        if !alive { break }
+                        let args = fn["arguments"] as? String ?? "{}"
+                        let argsDelta: [String: Any] = [
+                            "id": rid, "object": "chat.completion.chunk",
+                            "created": now(), "model": engine.modelName,
+                            "choices": [[
+                                "index": 0,
+                                "delta": ["tool_calls": [[
+                                    "index": idx,
+                                    "function": ["arguments": args],
+                                ]]],
+                                "finish_reason": NSNull(),
+                            ]],
+                        ]
+                        alive = self.chunk(
+                            fd, Data("data: ".utf8)
+                                + (try! JSONSerialization.data(withJSONObject: argsDelta))
+                                + Data("\n\n".utf8))
+                        if !alive { break }
+                    }
                 }
             }
             var fin: [String: Any] = [
@@ -1236,6 +1517,7 @@ public final class Server {
             endChunked(fd)
         } else {
             var message: [String: Any] = ["role": "assistant"]
+            if !split.reasoning.isEmpty { message["reasoning_content"] = split.reasoning }
             // OpenAI expects content to be string or null; null when tool_calls only
             if let calls = toolCalls {
                 message["content"] = text.isEmpty ? NSNull() : text as Any

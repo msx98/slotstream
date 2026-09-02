@@ -158,7 +158,8 @@ public final class Engine {
     /// are forwarded to the Jinja template so the model sees the <tools> block.
     /// Content may be String or [[String:Any]] (vision) — both are forwarded verbatim.
     public func encodeChatOpenAI(
-        messages: [[String: Any]], tools: [[String: Any]]?, thinking: Bool = false
+        messages: [[String: Any]], tools: [[String: Any]]?, thinking: Bool = false,
+        reasoningEffort: String? = nil
     ) throws -> [Int] {
         // Tokenizer typealiases are [String: any Sendable]; need to preserve nested arrays.
         func toSendable(_ v: Any) -> any Sendable {
@@ -189,9 +190,11 @@ public final class Engine {
             for (k, v) in dict { t[k] = toSendable(v) }
             return t
         }
+        var ctx: [String: any Sendable] = ["enable_thinking": thinking]
+        if let effort = reasoningEffort { ctx["reasoning_effort"] = effort }
         return try tokenizer.applyChatTemplate(
             messages: msgs, tools: toolSpecs,
-            additionalContext: ["enable_thinking": thinking])
+            additionalContext: ctx)
     }
 
     // MARK: Vision
@@ -208,8 +211,13 @@ public final class Engine {
 
     /// Tokenize with vision expansion: single image_pad per image -> N_merged pads.
     /// Returns expanded ids and concatenated vision embeddings [N, H] (or nil if no images).
-    public func encodeWithVision(messages: [[String: Any]], tools: [[String: Any]]?, thinking: Bool = false) throws -> ([Int], MLXArray?) {
-        let baseIds = try encodeChatOpenAI(messages: messages, tools: tools, thinking: thinking)
+    public func encodeWithVision(
+        messages: [[String: Any]], tools: [[String: Any]]?,
+        thinking: Bool = false, reasoningEffort: String? = nil
+    ) throws -> ([Int], MLXArray?) {
+        let baseIds = try encodeChatOpenAI(
+            messages: messages, tools: tools,
+            thinking: thinking, reasoningEffort: reasoningEffort)
         // Extract image URLs in template order
         var urls: [String] = []
         for m in messages {

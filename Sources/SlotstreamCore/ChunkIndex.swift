@@ -18,11 +18,14 @@
 //   - size_bytes: total bytes occupied by this chunk's directory
 //   - parent_sha: parent's key (NULL for depth 0)
 //
-// Eviction: when total size > SLOTSTREAM_KVCACHE_MAX_GB (default 20),
-// the saver deletes a forest of leaves (and orphans whose parent is gone)
-// whose combined size clears the deficit, choosing the lowest-value
-// chunks first (where a chunk's value is the max of its own and all its
-// descendants' last_used, so leaves with live children are protected).
+// Eviction: when total size exceeds the quota (--kv-cache-size, else env
+// SLOTSTREAM_KVCACHE_MAX_GB, default 20), the saver deletes a forest of
+// leaves (and orphans whose parent is gone) whose combined size clears the
+// deficit, choosing the lowest-value chunks first (where a chunk's value is
+// the max of its own and all its descendants' last_used, so leaves with live
+// children are protected). DiskCache.enforceQuota runs the same pass at
+// startup when the CLI flag lowers the quota; it also sweeps the evicted
+// chunks' directories off the disk.
 //
 // Crashes mid-save leave a `.kv.partial` file in the chunk directory; the
 // next save for that key detects the partial and rewrites. The metadata DB
@@ -37,7 +40,10 @@ import SQLite3
 /// internally. WAL mode tolerates concurrent readers (future split: stats
 /// tool) but writers serialize, which is what we want.
 public final class ChunkIndex {
-    static let shared = ChunkIndex()
+    /// Process-wide index singleton. Public so CLI-side checks can exercise
+    /// the eviction policy without a model; the DB opens at DiskCache.dir on
+    /// first touch, so overrides must be applied before the first use.
+    public static let shared = ChunkIndex()
 
     private var db: OpaquePointer?
     private let serial = DispatchQueue(label: "slotstream.chunkindex")

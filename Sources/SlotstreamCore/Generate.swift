@@ -199,7 +199,6 @@ fileprivate final class DecodeMeter {
     func snapshot() -> (tps: Double, drafted: Int, accepted: Int, emitted: Int, mtp: Bool) {
         let n = cumEmitted.count
         guard n > 0 else { return (0, 0, 0, 0, false) }
-        let totalEmitted = cumEmitted[n - 1]
         // Walk back from the newest round, accumulating emitted until adding
         // the next round would push the window past `window`. Always include
         // the newest round so the meter is never silent.
@@ -208,7 +207,7 @@ fileprivate final class DecodeMeter {
         var a = 0
         var firstIdx = n - 1
         for i in stride(from: n - 1, through: 0, by: -1) {
-            let delta = totalEmitted - (i > 0 ? cumEmitted[i - 1] : 0)
+            let delta = cumEmitted[i] - (i > 0 ? cumEmitted[i - 1] : 0)
             if e > 0 && e + delta > window { break }
             e += delta
             d += i > 0 ? cumDrafted[i] - cumDrafted[i - 1] : cumDrafted[i]
