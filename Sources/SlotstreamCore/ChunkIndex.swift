@@ -164,6 +164,16 @@ public func chainLength(
         serial.sync { touchInternal(key: key) }
     }
 
+    /// Whether the metadata index knows this content-addressed chunk.
+    public func contains(key: String) -> Bool {
+        serial.sync {
+            let stmt = prepare("SELECT 1 FROM chunks WHERE key = ? LIMIT 1;")
+            defer { sqlite3_finalize(stmt) }
+            sqlite3_bind_text(stmt, 1, key, -1, SQLITE_TRANSIENT)
+            return sqlite3_step(stmt) == SQLITE_ROW
+        }
+    }
+
     private func touchInternal(key: String) {
         let stmt = prepare("UPDATE chunks SET last_used = ? WHERE key = ?;")
         defer { sqlite3_finalize(stmt) }

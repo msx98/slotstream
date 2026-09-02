@@ -120,8 +120,16 @@ public enum DiskCache {
                 // so concurrent saves of the same key serialize on the queue.
                 let dataPath = base.appendingPathComponent("data.kv")
                 if FileManager.default.fileExists(atPath: dataPath.path) {
-                    log("save skipped: \(tokenIds.count) tokens depth=\(depth) key=\(key.prefix(12)) already complete on disk")
-                    ChunkIndex.shared.touch(key: key)
+                    let wasIndexed = ChunkIndex.shared.contains(key: key)
+                    if wasIndexed {
+                        ChunkIndex.shared.touch(key: key)
+                    } else {
+                        ChunkIndex.shared.register(
+                            key: key, parentSha: parentSha, depth: depth,
+                            sizeBytes: directorySize(at: base))
+                    }
+                    let reconciliation = wasIndexed ? "" : "; restored missing index row"
+                    log("save skipped: \(tokenIds.count) tokens depth=\(depth) key=\(key.prefix(12)) already complete on disk\(reconciliation)")
                     return
                 }
                 try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
@@ -259,7 +267,50 @@ public enum DiskCache {
         embed: (Int) -> [Float]?
     ) -> Int? {
         guard enabled, chunk > 0 else { return nil }
-        let depth = ChunkIndex.shared.chainLength(chunk: chunk, embedForDepth: embed) ?? 0
+        var parentSha: String? = nil
+        var depth = 0
+        while let embeddings = embed(depth) {
+            let key = ChunkIndex.makeKey(parentSha: parentSha, embeddings: embeddings)
+            let base = dir.appendingPathComponent(key, isDirectory: true)
+            let dataPath = base.appendingPathComponent("data.kv")
+            let isIndexed = ChunkIndex.shared.contains(key: key)
+            let isOnDisk = FileManager.default.fileExists(atPath: dataPath.path)
+            if isIndexed && isOnDisk {
+                ChunkIndex.shared.touch(key: key)
+                parentSha = key
+                depth += 1
+                continue
+            }
+
+            if isIndexed {
+                ChunkIndex.shared.remove(key: key)
+                log("chain break: depth=\(depth + 1) key=\(key.prefix(12)) indexed but data.kv is missing; removed stale index row")
+                break
+            }
+
+            if isOnDisk {
+                // A crash can publish data.kv and die before registering it.
+                // The save path also regards this atomic file as complete, so
+                // make lookup use the same source of truth and heal the index.
+                ChunkIndex.shared.register(
+                    key: key, parentSha: parentSha, depth: depth + 1,
+                    sizeBytes: directorySize(at: base))
+                log("lookup recovered: depth=\(depth + 1) key=\(key.prefix(12)) data.kv existed but index row was missing")
+                parentSha = key
+                depth += 1
+                continue
+            }
+
+            let partialPath = base.appendingPathComponent("data.kv.partial")
+            if FileManager.default.fileExists(atPath: partialPath.path) {
+                log("chain break: depth=\(depth + 1) key=\(key.prefix(12)) index row missing; only data.kv.partial exists")
+            } else if FileManager.default.fileExists(atPath: base.path) {
+                log("chain break: depth=\(depth + 1) key=\(key.prefix(12)) index row and data.kv missing; key directory exists")
+            } else {
+                log("chain break: depth=\(depth + 1) key=\(key.prefix(12)) absent from index and disk")
+            }
+            break
+        }
         return depth == 0 ? nil : depth * chunk
     }
 
@@ -288,8 +339,18 @@ public enum DiskCache {
         template: Qwen4ExpModel.State,
         model: String = "qwen38"
     ) -> Qwen4ExpModel.State? {
-        guard enabled, depth >= 0 else { return nil }
-        guard let chunkEmb = embed(depth - 1 >= 0 ? depth - 1 : 0) else { return nil }
+        guard enabled else {
+            log("load skipped: disk cache disabled")
+            return nil
+        }
+        guard depth > 0 else {
+            log("load failed: invalid chain depth \(depth)")
+            return nil
+        }
+        guard let chunkEmb = embed(depth - 1) else {
+            log("load failed: embeddings unavailable at depth=\(depth)")
+            return nil
+        }
         // Resolve the parent's chain key: walk depths 0..<(depth-1), composing
         // each step from the per-chunk embeddings. For depth=0 the parent is
         // nil (no chunks consumed); for depth=N it's chain[N-1] from walking
@@ -297,7 +358,10 @@ public enum DiskCache {
         var parentSha: String? = nil
         if depth >= 1 {
             for i in 0..<(depth - 1) {
-                guard let e = embed(i) else { return nil }
+                guard let e = embed(i) else {
+                    log("load failed: parent embeddings unavailable at depth=\(i + 1)")
+                    return nil
+                }
                 parentSha = ChunkIndex.makeKey(parentSha: parentSha, embeddings: e)
             }
         }
@@ -307,6 +371,7 @@ public enum DiskCache {
         guard FileManager.default.fileExists(atPath: dataPath.path) else {
             // Index says exists but file is gone — clean up.
             ChunkIndex.shared.remove(key: key)
+            log("load failed: depth=\(depth) key=\(key.prefix(12)) indexed but data.kv is missing; removed stale index row")
             return nil
         }
         guard let data = try? Data(contentsOf: dataPath) else {
@@ -341,19 +406,29 @@ public enum DiskCache {
         // and the float byte count is derived from the parsed shape so we
         // never consume into the next array's header.
         var arraysByName: [String: MLXArray] = [:]
+        var bodyFailure: String? = nil
         while body.count >= 4 {
             let len = body[0..<4]
                 .withUnsafeBytes { $0.load(as: UInt32.self).littleEndian }
             let headerSize = 4 + Int(len)
-            guard body.count >= headerSize else { break }
+            guard body.count >= headerSize else {
+                bodyFailure = "truncated array header"
+                break
+            }
             let headerData = body[4..<headerSize]
             guard let header = try? JSONSerialization.jsonObject(with: headerData) as? [String: Any],
                   let name = header["name"] as? String,
                   let shape = header["shape"] as? [Int]
-            else { break }
+            else {
+                bodyFailure = "invalid array header JSON"
+                break
+            }
             let elementCount = shape.reduce(1, *)
             let dataBytes = elementCount * 4
-            guard body.count >= headerSize + dataBytes else { break }
+            guard body.count >= headerSize + dataBytes else {
+                bodyFailure = "truncated array data for \(name)"
+                break
+            }
             let raw = body[headerSize..<(headerSize + dataBytes)]
             body = body.subdata(in: (headerSize + dataBytes)..<body.count)
             let floats = raw.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
@@ -368,6 +443,10 @@ public enum DiskCache {
             default: dt = .bfloat16
             }
             arraysByName[name] = MLXArray(floats, shape).asType(dt)
+        }
+        if let failure = bodyFailure {
+            log("load failed: depth=\(depth) key=\(key.prefix(12)) \(failure)")
+            return nil
         }
 
         for l in template.linear.keys {
@@ -398,7 +477,10 @@ public enum DiskCache {
             // Stale entry without MTP arrays would crash the next consume();
             // bail so the caller rebuilds from scratch.
             guard arraysByName["mtp_kv_k"] != nil, arraysByName["mtp_kv_v"] != nil
-            else { return nil }
+            else {
+                log("load failed: depth=\(depth) key=\(key.prefix(12)) mtpOffset=\(mtpOff) but MTP KV arrays are missing")
+                return nil
+            }
         }
         if let mtpOff = meta["mtpOffset"] as? Int,
            let k = arraysByName["mtp_kv_k"], let v = arraysByName["mtp_kv_v"]
@@ -411,6 +493,7 @@ public enum DiskCache {
         }
 
         ChunkIndex.shared.touch(key: key)
+        log("load done: \(tokenIds.count) tokens depth=\(depth) key=\(key.prefix(12))")
         return state
     }
 
