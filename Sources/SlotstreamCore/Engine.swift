@@ -404,12 +404,19 @@ public final class Engine {
             return ok
         } : nil
 
-        let (ids, stats) = generator.generate(
+        let (ids, genStats) = generator.generate(
             promptIds: promptIds, params: params, eosIds: eosIds, cache: prefixCache, visionEmbeds: visionEmbeds,
             shouldContinue: {
                 guard !clientGone, !stopFound else { return false }
                 return shouldContinue?() ?? true
             }, onToken: tokenHandler)
+        var stats = genStats
+        // Decode the terminating EOS token (special markers included) so the
+        // raw log can record exactly which token ended the run.
+        if let sid = stats.stopTokenId {
+            let t = tokenizer.decode(tokens: [sid], skipSpecialTokens: false)
+            stats.stopTokenHex = Data(t.utf8).map { String(format: "%02x", $0) }.joined()
+        }
 
         var text = tokenizer.decode(tokens: ids, skipSpecialTokens: true)
         if !stops.isEmpty, let cut = Self.stopIndex(text, stops) {

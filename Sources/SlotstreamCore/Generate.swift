@@ -95,6 +95,13 @@ public struct GenStats {
     public var prefillRecords = 0
     /// "stop" (EOS, a stop sequence, or a cancelled stream) or "length".
     public var finishReason = "stop"
+    /// The end-of-sequence token that ended generation, when that is why it
+    /// ended. Nil for stop sequences, client disconnects, and max tokens —
+    /// no single token ends the run there. `stopTokenHex` is filled by
+    /// Engine.generate (which owns the tokenizer) as the hex bytes of the
+    /// token's text, special-token markers included.
+    public var stopTokenId: Int? = nil
+    public var stopTokenHex: String? = nil
 
     public var prefillTPS: Double { prefillSeconds > 0 ? Double(prefillTokens) / prefillSeconds : 0 }
     public var prefixHit: Bool { reusedPrefixTokens > 0 }
@@ -525,7 +532,9 @@ public final class Generator {
             for _ in 0 ..< max(0, params.maxTokens) {
                 if let keepGoing = shouldContinue, !keepGoing() { reason = "stop"; break }
                 let tok = sample(logits, params: params, generated: generated)
-                if eosIds.contains(tok) { reason = "stop"; break }
+                if eosIds.contains(tok) {
+                    reason = "stop"; stats.stopTokenId = tok; break
+                }
                 out.append(tok)
                 generated.insert(tok)
                 // Throttled decode progress: every 16 tokens or 1s
@@ -627,7 +636,9 @@ extension Generator {
         if params.maxTokens > 0 {
             if let keepGoing = shouldContinue, !keepGoing() { reason = "stop"; return }
             let tok = sample(logits, params: params, generated: generated)
-            if eosIds.contains(tok) { reason = "stop"; return }
+            if eosIds.contains(tok) {
+                reason = "stop"; stats.stopTokenId = tok; return
+            }
             out.append(tok)
             generated.insert(tok)
             if let cb = onToken, !cb(tok) { reason = "stop"; return }
@@ -695,7 +706,9 @@ extension Generator {
                 if out.count >= params.maxTokens { break }  // reason stays "length"
                 let tok = sample(
                     vLogits[0..., i ..< (i + 1), 0...], params: params, generated: generated)
-                if eosIds.contains(tok) { reason = "stop"; break }
+                if eosIds.contains(tok) {
+                    reason = "stop"; stats.stopTokenId = tok; break
+                }
                 out.append(tok)
                 generated.insert(tok)
                 if let cb = onToken, !cb(tok) { reason = "stop"; break }

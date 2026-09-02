@@ -433,12 +433,19 @@ public final class Server {
         ])
     }
 
-    func logResponse(id: String, endpoint: String, response: String) {
+    func logResponse(
+        id: String, endpoint: String, response: String,
+        finish: String? = nil, stopTokenId: Int? = nil, stopTokenHex: String? = nil
+    ) {
         guard outputPath != nil else { return }
-        logRawLine([
+        var entry: [String: Any] = [
             "ts": iso(Date()), "id": id, "kind": "response",
             "endpoint": endpoint, "response": response,
-        ])
+        ]
+        if let finish = finish { entry["finish"] = finish }
+        if let stopTokenId = stopTokenId { entry["stop_token_id"] = stopTokenId }
+        if let stopTokenHex = stopTokenHex { entry["stop_token_hex"] = stopTokenHex }
+        logRawLine(entry)
     }
 
     // MARK: params
@@ -1013,7 +1020,12 @@ public final class Server {
         let (text, _, stats) = engine.generate(
             promptIds: ids, params: params, visionEmbeds: visionEmbeds,
             shouldContinue: { self.peerAlive(fd) }, onToken: callback)
-        if logDeltas { logResponse(id: logId, endpoint: "/api/chat", response: text) }
+        if logDeltas {
+            logResponse(
+                id: logId, endpoint: "/api/chat", response: text,
+                finish: stats.finishReason, stopTokenId: stats.stopTokenId,
+                stopTokenHex: stats.stopTokenHex)
+        }
         let final: [String: Any] = [
             "model": engine.modelName, "created_at": iso(Date()),
             "message": ["role": "assistant", "content": stream ? "" : text],
@@ -1125,7 +1137,12 @@ public final class Server {
         let (text, _, stats) = engine.generate(
             promptIds: ids, params: params,
             shouldContinue: { self.peerAlive(fd) }, onToken: callback)
-        if logDeltas { logResponse(id: logId, endpoint: "/api/generate", response: text) }
+        if logDeltas {
+            logResponse(
+                id: logId, endpoint: "/api/generate", response: text,
+                finish: stats.finishReason, stopTokenId: stats.stopTokenId,
+                stopTokenHex: stats.stopTokenHex)
+        }
         let final: [String: Any] = [
             "model": engine.modelName, "created_at": iso(Date()),
             "response": stream ? "" : text, "done": true, "done_reason": stats.finishReason,
@@ -1252,6 +1269,42 @@ public final class Server {
             return self.chunk(fd, Data("data: ".utf8) + data + Data("\n\n".utf8))
         }
 
+        /// Returns the substring of `buf` starting at `after`, minus any
+        /// <tool_call>...</tool_call> block ranges that fall at or after
+        /// `after`. Used so content deltas after </think> don't leak the raw
+        /// tool-call XML alongside the parsed tool_calls deltas.
+        func cleanContentTail(
+            _ buf: String, after: String.Index,
+            toolCloseRegex: NSRegularExpression?
+        ) -> String {
+            guard let regex = toolCloseRegex else { return String(buf[after...]) }
+            let ns = buf as NSString
+            let allMatches = regex.matches(
+                in: buf, range: NSRange(location: 0, length: ns.length))
+            // Tool_call blocks entirely at or after the start position. Anything
+            // overlapping the reasoning boundary is left untouched.
+            let afterUtf16 = after.utf16Offset(in: buf)
+            let blocks = allMatches
+                .map { $0.range }
+                .filter { $0.location >= afterUtf16 }
+                .sorted { $0.location < $1.location }
+            var pieces: [String] = []
+            var cursor = afterUtf16
+            let total = ns.length
+            for tr in blocks {
+                if tr.location > cursor {
+                    pieces.append(ns.substring(
+                        with: NSRange(location: cursor, length: tr.location - cursor)))
+                }
+                cursor = tr.location + tr.length
+            }
+            if cursor < total {
+                pieces.append(ns.substring(
+                    with: NSRange(location: cursor, length: total - cursor)))
+            }
+            return pieces.joined()
+        }
+
         /// Build the args dict for one tool_call block from its inner XML.
         /// Returns the canonical sorted JSON string of those args.
         func parseArgs(inner: String, name: String) -> String {
@@ -1354,8 +1407,13 @@ public final class Server {
                         reasoningSent = reasoning.count
                     }
                 }
-                let after = streamBuf.index(after: r.upperBound)
-                let tail = String(streamBuf[after...])
+                // Anything after </think> is real content — but we must skip
+                // any <tool_call>...</tool_call> blocks in that tail so the
+                // raw XML isn't emitted as a content delta in addition to the
+                // parsed tool_calls deltas (which is what OpenCode users see
+                // as "the tool call appearing twice, in the raw text").
+                let afterIdx = streamBuf.index(after: r.upperBound)
+                let tail = cleanContentTail(streamBuf, after: afterIdx, toolCloseRegex: toolCloseRegex)
                 if tail.count > contentSent {
                     let toSend = String(tail.dropFirst(contentSent))
                     if !toSend.isEmpty {
@@ -1439,7 +1497,12 @@ public final class Server {
         let (rawText, _, stats) = engine.generate(
             promptIds: ids, params: params, visionEmbeds: visionEmbeds,
             shouldContinue: { self.peerAlive(fd) }, onToken: callback)
-        if logDeltas { logResponse(id: logId, endpoint: "/v1/chat/completions", response: rawText) }
+        if logDeltas {
+            logResponse(
+                id: logId, endpoint: "/v1/chat/completions", response: rawText,
+                finish: stats.finishReason, stopTokenId: stats.stopTokenId,
+                stopTokenHex: stats.stopTokenHex)
+        }
         // Split reasoning from the visible response first, then parse tool
         // calls out of the content part only — so reasoning text never leaks
         // into parsed.content and vice versa.
