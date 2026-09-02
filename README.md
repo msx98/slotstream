@@ -106,10 +106,12 @@ OLLAMA_HOST=http://localhost:11434 ollama run qwen3.8-flash-next:4bit
 ```
 
 Open WebUI, the Ollama CLI, and the OpenAI SDKs are tested against this
-subset. Streaming, CORS, and the usual sampling options all work. What isn't
-supported (tools, images, JSON-schema output, logprobs) returns a clear 400
-instead of being silently ignored. Every endpoint, field, default, and error
-is in [docs/API.md](docs/API.md).
+subset. Streaming, CORS, and the usual sampling options all work. Tool calling
+and vision (`image_url`) are supported on `/v1/chat/completions` (Qwen
+`<tool_call>` XML ↔ OpenAI `tool_calls`, streamed incrementally). What isn't
+supported (JSON-schema output, logprobs) returns a clear 400 instead of being
+silently ignored. Every endpoint, field, default, and error is in
+[docs/API.md](docs/API.md).
 
 ## Speed
 

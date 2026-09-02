@@ -222,8 +222,28 @@ public final class Generator {
         let isVision = visionEmbeds != nil
         let hit = isVision ? nil : cache?.take(
             matching: promptIds, reserveTokens: promptIds.count + params.maxTokens)
-        let state = hit?.state ?? model.makeState()
-        let reused = hit?.reused ?? 0
+        // Disk cache: try longest chunk-aligned prefix on disk before falling back to RAM cache
+        var diskState: Qwen4ExpModel.State? = nil
+        var diskHitLen: Int? = nil
+        if !isVision, let l = DiskCache.longestPrefixHit(for: promptIds, chunk: prefillChunk) {
+            let curReused = hit?.reused ?? 0
+            if l > curReused, let ds = DiskCache.loadState(for: Array(promptIds[0..<l]), template: model.makeState()) {
+                diskState = ds
+                diskHitLen = l
+                FileHandle.standardError.write("kvcache disk hit: \(l)/\(promptIds.count) tokens\n".data(using: .utf8)!)
+            }
+        }
+        let state: Qwen4ExpModel.State
+        let reused: Int
+        if let ds = diskState, let l = diskHitLen {
+            state = ds
+            reused = l
+            // Return the RAM hit state to the pool if we used disk instead
+            if let h = hit { cache?.store(state: h.state, tokens: Array(promptIds[0..<h.reused])) }
+        } else {
+            state = hit?.state ?? model.makeState()
+            reused = hit?.reused ?? 0
+        }
         stats.promptTokens = promptIds.count
         stats.reusedPrefixTokens = reused
         MLX.Memory.peakMemory = 0
@@ -304,6 +324,13 @@ public final class Generator {
             } else {
                 let h = model.hiddenStates(chunk, state: state, visionEmbeds: chunkVision)
                 eval(h)
+            }
+            // Persist a chunk-aligned prefix for disk reuse. Done after the
+            // chunk compute so the state it captures is exactly what a future
+            // hit would reload. log() inside saveAsync tells us if/when it
+            // actually wrote — silent failure here is not acceptable.
+            if !isVision, DiskCache.enabled, hi % prefillChunk == 0, hi < promptIds.count {
+                DiskCache.saveAsync(state: state, tokens: Array(promptIds[0..<hi]))
             }
             i = hi
         }

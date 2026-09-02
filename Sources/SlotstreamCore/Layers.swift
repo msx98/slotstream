@@ -115,15 +115,26 @@ final class KVCache {
     /// Roll back to `n` entries. Bytes past `n` stay in the buffer but are
     /// dead: the next update writes over them, and fetches slice 0..<offset.
     func trim(to n: Int) { offset = min(offset, max(0, n)) }
+
+    func restoreFromArrays(keys: MLXArray, values: MLXArray, offset: Int) {
+        self.keys = keys
+        self.values = values
+        self.offset = offset
+    }
 }
 
 /// Grown in blocks like KVCache rather than re-concatenated per token: a
 /// fresh `concatenated` every step copies the whole cache each time, which is
 /// quadratic in context length. Values are identical either way.
 final class IndexerCache {
-    private var buf: MLXArray?  // (B, cap, dim)
+    fileprivate var buf: MLXArray?  // (B, cap, dim)
     private(set) var offset = 0
     let step = 1024
+    func snapshot() -> MLXArray? { buf }
+    func restore(from arr: MLXArray, offset: Int) {
+        self.buf = arr
+        self.offset = offset
+    }
 
     func update(_ k: MLXArray) -> MLXArray {
         let s = k.dim(1)

@@ -179,6 +179,26 @@ public final class SlotPool {
     private var hand = 0
     public private(set) var hits = 0
     public private(set) var misses = 0
+    // Per-layer normalized heat: heat[l][e] sums to 1 per layer.
+    // Update on each MoE dispatch: hit experts get + (1-alpha)/k, all decay by alpha.
+    // alpha <1, controlled by SLOTSTREAM_HEAT_ALPHA (or legacy SLOTSTREAM_LFU_DECAY).
+    private var heat: [[Double]] = Array(repeating: Array(repeating: 1.0/512.0, count: 512), count: 48)
+    private var lastAccess: [ExpertKey: Int] = [:]
+    private var lfuClock = 0
+    static let heatAlpha: Double = {
+        if let s = ProcessInfo.processInfo.environment["SLOTSTREAM_HEAT_ALPHA"], let v = Double(s), v >= 0, v <= 1 { return v }
+        if let s = ProcessInfo.processInfo.environment["SLOTSTREAM_LFU_DECAY"], let v = Double(s), v >= 0, v <= 1 { return v }
+        return 0.99
+    }()
+    // Kept for compat: decay interval now unused (per-access decay)
+    static let lfuDecay: Double = heatAlpha
+    static let lfuDecayInterval: Int = {
+        if let s = ProcessInfo.processInfo.environment["SLOTSTREAM_LFU_DECAY_INTERVAL"], let v = Int(s), v > 0 { return v }
+        return 0
+    }()
+    static let lfuDecodeOnly: Bool = {
+        ProcessInfo.processInfo.environment["SLOTSTREAM_LFU_DECODE_ONLY"] != nil
+    }()
 
     public var poolBytes: Int { pools.reduce(0) { $0 + $1.nbytes } }
     /// Bytes per expert record, measured from the checkpoint headers.
@@ -263,32 +283,96 @@ public final class SlotPool {
         slots = n
     }
 
-    private func victim() -> Int {
-        var scanned = 0
-        while true {
-            let s = hand
-            hand = (hand + 1) % slots
-            if pinned[s] {
-                scanned += 1
-                precondition(
-                    scanned < 3 * slots,
-                    "slot pool exhausted: all \(slots) slots pinned. The pool must "
-                        + "hold at least one prefill chunk's expert set per layer "
-                        + "(~512 + margin); raise --experts-per-layer.")
-                continue
+    private func updateHeat(layer: Int, hits: Set<Int>) {
+        let alpha = Self.heatAlpha
+        guard alpha >= 0, alpha < 1, hits.count > 0 else { return }
+        let k = Double(hits.count)
+        let boost = (1.0 - alpha) / k
+        for e in 0..<512 {
+            if hits.contains(e) {
+                heat[layer][e] = heat[layer][e] * alpha + boost
+            } else {
+                heat[layer][e] *= alpha
             }
-            if refBit[s] { refBit[s] = false; scanned += 1; continue }
-            return s
+        }
+        // Renormalize to 1 (floating error)
+        let sum = heat[layer].reduce(0, +)
+        if sum > 0 {
+            for e in 0..<512 { heat[layer][e] /= sum }
         }
     }
 
+    private func victim() -> Int {
+        // Coldest heat first, LRU breaks ties — O(slots) scan, slots ≤ 24576
+        var best: Int? = nil
+        var bestHeat = Double.greatestFiniteMagnitude
+        var bestTime = Int.max
+        var pinnedCount = 0
+        for s in 0..<slots {
+            if pinned[s] { pinnedCount += 1; continue }
+            let key = keyOf[s]
+            let h: Double
+            let t: Int
+            if let k = key {
+                h = heat[k.layer][k.expert]
+                t = lastAccess[k] ?? -1
+            } else {
+                h = -1 // empty slot is coldest
+                t = -1
+            }
+            if h < bestHeat || (h == bestHeat && t < bestTime) {
+                bestHeat = h; bestTime = t; best = s
+            }
+        }
+        guard let b = best else {
+            preconditionFailure(
+                "slot pool exhausted: all \(slots) slots pinned (\(pinnedCount)). The pool must "
+                    + "hold at least one prefill chunk's expert set per layer "
+                    + "(~512 + margin); raise --experts-per-layer.")
+        }
+        return b
+    }
+
+    /// 48 x 512 heat matrix: per-layer probability (sums to 1 per layer).
+    public func heatMatrix() -> [[Double]] {
+        heat
+    }
+    public func heatMatrixInt(scaled: Int = 1000000) -> [[Int]] {
+        heat.map { row in row.map { Int(($0 * Double(scaled)).rounded()) } }
+    }
+
+    /// Sparse heat for API: [[layer, expert, heat*1e6, lastAccess]] sorted hottest first.
+    public func heatSparse() -> [[Int]] {
+        var out: [[Int]] = []
+        out.reserveCapacity(48*10)
+        for l in 0..<48 {
+            for e in 0..<512 {
+                let h = heat[l][e]
+                if h > 0.0001 {
+                    out.append([l, e, Int((h * 1_000_000).rounded()), lastAccess[ExpertKey(l, e)] ?? 0])
+                }
+            }
+        }
+        out.sort { $0[2] > $1[2] }
+        return out
+    }
+
     /// Ensure all keys resident; returns slot index per key (same order).
-    /// Pins the returned slots until `unpinAll()`.
+    /// Pins the returned slots until `unpinAll()`. Per-layer heat: each layer
+    /// sums to 1, hits get boost, others decay by alpha, LRU breaks ties.
     public func ensure(_ keys: [ExpertKey]) -> [Int] {
         var result = Array(repeating: -1, count: keys.count)
         var missKeys: [ExpertKey] = []
         var missPos: [Int] = []
+        let isDecodeOnly = Self.lfuDecodeOnly
+        let isPrefillBatch = keys.count > 30
+        let shouldCount = !(isDecodeOnly && isPrefillBatch)
+        var hitsPerLayer: [Int: Set<Int>] = [:]
         for (i, k) in keys.enumerated() {
+            if shouldCount {
+                hitsPerLayer[k.layer, default: Set()].insert(k.expert)
+                lastAccess[k] = lfuClock; lfuClock += 1
+            }
             if let s = map[k] {
                 result[i] = s
                 refBit[s] = true
@@ -298,6 +382,11 @@ public final class SlotPool {
                 missKeys.append(k)
                 missPos.append(i)
                 misses += 1
+            }
+        }
+        if shouldCount {
+            for (layer, hits) in hitsPerLayer {
+                updateHeat(layer: layer, hits: hits)
             }
         }
         if !missKeys.isEmpty {

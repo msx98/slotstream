@@ -245,6 +245,24 @@ public final class Server {
             return
         }
         let json = parsed ?? [:]
+        // Heat matrix: handle with or without ?full=1 query
+        let pathBase = String(req.path.split(separator: "?").first ?? Substring(req.path))
+        if req.method == "GET" && (pathBase == "/api/heat" || pathBase == "/v1/heat") {
+            let heat = engine.withExclusive { engine.model.pool.heatSparse() }
+            let wantDense = req.path.contains("full")
+            var resp: [String: Any] = [
+                "layers": 48, "experts_per_layer": 512,
+                "sparse": heat,
+                "total_accesses": heat.reduce(0) { $0 + $1[2] },
+                "slots": engine.withExclusive { engine.model.pool.slots },
+            ]
+            if wantDense {
+                let dense = engine.withExclusive { engine.model.pool.heatMatrix() }
+                resp["dense"] = dense
+            }
+            respondJSON(fd, resp, cors: cors)
+            return
+        }
         switch (req.method, req.path) {
         case ("GET", "/api/version"):
             respondJSON(fd, ["version": SlotstreamBuild.version], cors: cors)
@@ -416,6 +434,12 @@ public final class Server {
             ? nil : "model '\(requested)' is not loaded; this server has only '\(engine.modelName)'"
     }
 
+    private func openAIModelError(_ json: [String: Any]) -> String? {
+        guard let raw = json["model"] else { return nil }
+        guard let s = raw as? String, !s.isEmpty else { return "model must be text" }
+        return nil // permissive: any non-empty model id is accepted for OpenAI compat (opencode sends provider/model)
+    }
+
     private static func unsupportedKey(
         _ json: [String: Any], allowed: Set<String>
     ) -> String? {
@@ -575,7 +599,7 @@ public final class Server {
     }
 
     private func openAIValidationError(_ json: [String: Any]) -> String? {
-        if let e = modelError(json) { return e }
+        if let e = openAIModelError(json) { return e }
         let allowed: Set<String> = [
             "model", "messages", "stream", "temperature", "top_p", "top_k",
             "presence_penalty", "frequency_penalty", "max_tokens", "max_completion_tokens",
@@ -703,9 +727,29 @@ public final class Server {
                 let pMatches = pr.matches(in: inner, range: NSRange(location: 0, length: (inner as NSString).length))
                 for pm in pMatches {
                     let key = (inner as NSString).substring(with: pm.range(at: 1))
-                    let val = (inner as NSString).substring(with: pm.range(at: 2))
-                    // try to keep JSON types: if val looks like JSON, keep as string for OpenAI arguments (expects JSON string)
-                    args[key] = val
+                    let rawVal = (inner as NSString).substring(with: pm.range(at: 2)).trimmingCharacters(in: .whitespacesAndNewlines)
+                    // Structured JSON objects/arrays were emitted via tojson — restore them.
+                    if (rawVal.hasPrefix("{") && rawVal.hasSuffix("}"))
+                        || (rawVal.hasPrefix("[") && rawVal.hasSuffix("]"))
+                    {
+                        if let d = rawVal.data(using: .utf8),
+                            let obj = try? JSONSerialization.jsonObject(with: d, options: [.allowFragments])
+                        {
+                            args[key] = obj
+                            continue
+                        }
+                    }
+                    if rawVal == "true" {
+                        args[key] = true
+                    } else if rawVal == "false" {
+                        args[key] = false
+                    } else if rawVal == "null" {
+                        args[key] = NSNull()
+                    } else {
+                        // Keep as string. Blind Int("123")->123 breaks opencode's
+                        // string-typed tools (bash command, filePath, etc.).
+                        args[key] = rawVal
+                    }
                 }
             }
             let argsJSON: String
@@ -959,15 +1003,100 @@ public final class Server {
         let rid = "chatcmpl-\(UUID().uuidString.prefix(8))"
         if stream, !startChunked(fd, contentType: "text/event-stream", cors: cors) { return }
         var alive = true
+        // Translate Qwen <tool_call> XML to OpenAI tool_calls incrementally.
+        // The model emits XML; we parse complete blocks in the stream buffer
+        // and emit delta.tool_calls as soon as a block closes, while streaming
+        // only the prefix before the first block as content. This avoids leaking
+        // raw XML and avoids the post-hoc duplicate that required suppression.
+        var streamBuf = ""
+        var streamSent = 0
+        var emittedToolCalls = 0
+        let toolPattern = "<tool_call>\\s*<function=([^>]+)>\\s*(.*?)\\s*</function>\\s*</tool_call>"
+        let paramPattern = "<parameter=([^>]+)>\\s*(.*?)\\s*</parameter>"
         let callback: ((Int, String) -> Bool)? = stream ? { _, delta in
             guard alive, !delta.isEmpty else { return alive }
-            let obj: [String: Any] = [
-                "id": rid, "object": "chat.completion.chunk",
-                "created": Int(Date().timeIntervalSince1970), "model": self.engine.modelName,
-                "choices": [["index": 0, "delta": ["content": delta], "finish_reason": NSNull()]],
-            ]
-            let data = try! JSONSerialization.data(withJSONObject: obj)
-            alive = self.chunk(fd, Data("data: ".utf8) + data + Data("\n\n".utf8))
+            streamBuf += delta
+            // Stream prefix (reasoning) before first tool_call, once.
+            if let r = streamBuf.range(of: "<tool_call>") {
+                let prefix = String(streamBuf[..<r.lowerBound])
+                if prefix.count > streamSent, !prefix.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    let toSend = String(prefix.dropFirst(streamSent))
+                    if !toSend.isEmpty {
+                        let obj: [String: Any] = [
+                            "id": rid, "object": "chat.completion.chunk",
+                            "created": Int(Date().timeIntervalSince1970), "model": self.engine.modelName,
+                            "choices": [["index": 0, "delta": ["content": toSend], "finish_reason": NSNull()]],
+                        ]
+                        let data = try! JSONSerialization.data(withJSONObject: obj)
+                        alive = self.chunk(fd, Data("data: ".utf8) + data + Data("\n\n".utf8))
+                        streamSent = prefix.count
+                    }
+                }
+            } else {
+                // No tool tag yet — stream content normally.
+                let obj: [String: Any] = [
+                    "id": rid, "object": "chat.completion.chunk",
+                    "created": Int(Date().timeIntervalSince1970), "model": self.engine.modelName,
+                    "choices": [["index": 0, "delta": ["content": delta], "finish_reason": NSNull()]],
+                ]
+                let data = try! JSONSerialization.data(withJSONObject: obj)
+                alive = self.chunk(fd, Data("data: ".utf8) + data + Data("\n\n".utf8))
+                streamSent += delta.count
+                // No tool tag, nothing more to do.
+                return alive
+            }
+            // Incremental tool_calls: emit each newly completed block.
+            guard let regex = try? NSRegularExpression(pattern: toolPattern, options: [.dotMatchesLineSeparators]) else { return alive }
+            let ns = streamBuf as NSString
+            let matches = regex.matches(in: streamBuf, range: NSRange(location: 0, length: ns.length))
+            if matches.count > emittedToolCalls {
+                for idx in emittedToolCalls ..< matches.count {
+                    let m = matches[idx]
+                    let name = ns.substring(with: m.range(at: 1)).trimmingCharacters(in: .whitespacesAndNewlines)
+                    let inner = ns.substring(with: m.range(at: 2))
+                    var args: [String: Any] = [:]
+                    if let pr = try? NSRegularExpression(pattern: paramPattern, options: [.dotMatchesLineSeparators]) {
+                        let innerNS = inner as NSString
+                        let pMatches = pr.matches(in: inner, range: NSRange(location: 0, length: innerNS.length))
+                        for pm in pMatches {
+                            let key = innerNS.substring(with: pm.range(at: 1))
+                            let rawVal = innerNS.substring(with: pm.range(at: 2)).trimmingCharacters(in: .whitespacesAndNewlines)
+                            if (rawVal.hasPrefix("{") && rawVal.hasSuffix("}")) || (rawVal.hasPrefix("[") && rawVal.hasSuffix("]")) {
+                                if let d = rawVal.data(using: .utf8), let obj = try? JSONSerialization.jsonObject(with: d, options: [.allowFragments]) {
+                                    args[key] = obj
+                                    continue
+                                }
+                            }
+                            if rawVal == "true" { args[key] = true }
+                            else if rawVal == "false" { args[key] = false }
+                            else if rawVal == "null" { args[key] = NSNull() }
+                            else { args[key] = rawVal }
+                        }
+                    }
+                    let argsJSON: String
+                    if let data = try? JSONSerialization.data(withJSONObject: args, options: [.sortedKeys]), let s = String(data: data, encoding: .utf8) {
+                        argsJSON = s
+                    } else { argsJSON = "{}" }
+                    let deltaObj: [String: Any] = [
+                        "id": rid, "object": "chat.completion.chunk",
+                        "created": Int(Date().timeIntervalSince1970), "model": self.engine.modelName,
+                        "choices": [[
+                            "index": 0,
+                            "delta": ["tool_calls": [[
+                                "index": idx,
+                                "id": "call_\(idx)",
+                                "type": "function",
+                                "function": ["name": name, "arguments": argsJSON],
+                            ]]],
+                            "finish_reason": NSNull(),
+                        ]],
+                    ]
+                    let d = try! JSONSerialization.data(withJSONObject: deltaObj)
+                    alive = self.chunk(fd, Data("data: ".utf8) + d + Data("\n\n".utf8))
+                    if !alive { break }
+                }
+                emittedToolCalls = matches.count
+            }
             return alive
         } : nil
         let (rawText, _, stats) = engine.generate(
@@ -978,9 +1107,11 @@ public final class Server {
         let toolCalls = parsed.calls
         let finishReason: String = toolCalls != nil ? "tool_calls" : stats.finishReason
         if stream, alive {
-            // If model produced tool calls, emit them as incremental deltas before the final
-            if let calls = toolCalls {
-                for (idx, call) in calls.enumerated() {
+            // Emit any tool_calls not already streamed incrementally (fallback for
+            // non-stream incremental edge where a block closed after the last callback).
+            if let calls = toolCalls, calls.count > emittedToolCalls {
+                for idx in emittedToolCalls ..< calls.count {
+                    let call = calls[idx]
                     let deltaObj: [String: Any] = [
                         "id": rid, "object": "chat.completion.chunk",
                         "created": Int(Date().timeIntervalSince1970), "model": self.engine.modelName,

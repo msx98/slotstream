@@ -15,6 +15,7 @@ struct Slotstream: ParsableCommand {
             NgramGolden.self, DequantGolden.self, TemplateCheck.self, SamplerGolden.self, GovernorCheck.self,
             PrefixCheck.self, ElasticDrill.self, RuntimeCheck.self, PullCheck.self,
             MTPParity.self, MTPAccept.self, MTPCheck.self, MTPFixtureInputs.self, MTPBench.self,
+            Heat.self,
         ]
     )
 }
@@ -1344,6 +1345,114 @@ struct TemplateCheck: ParsableCommand {
         sem.wait()
         if let e = err { throw e }
         print(out.map(String.init).joined(separator: ","))
+    }
+}
+
+struct Heat: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "heat",
+        abstract: "Show expert heat matrix (LFU frequencies) from a running server")
+    @Option var port: UInt16 = 11434
+    @Option var top: Int = 20
+    @Flag var ascii = false
+
+    func run() throws {
+        var data: Data?
+        var fetchErr: Error?
+        let url = URL(string: "http://127.0.0.1:\(port)/api/heat")!
+        let sem = DispatchSemaphore(value: 0)
+        URLSession.shared.dataTask(with: url) { d, _, e in
+            data = d; fetchErr = e; sem.signal()
+        }.resume()
+        let timedOut = sem.wait(timeout: .now() + 3) == .timedOut
+        if timedOut || data == nil {
+            // Fallback raw socket for sandboxed env
+            var raw = Data()
+            let req = "GET /api/heat HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+            let fd = SocketHelper.connect(port: port)
+            if fd >= 0 {
+                _ = req.withCString { ptr in send(fd, ptr, strlen(ptr), 0) }
+                var buf = [UInt8](repeating: 0, count: 65536)
+                while true {
+                    let n = recv(fd, &buf, buf.count, 0)
+                    if n <= 0 { break }
+                    raw.append(contentsOf: buf[0..<n])
+                }
+                close(fd)
+                if let r = raw.range(of: Data("\r\n\r\n".utf8)) {
+                    let body = Data(raw[r.upperBound...])
+                    // handle chunked? strip chunk headers if present
+                    if body.starts(with: Data("{\"layers\"".utf8)) {
+                        data = body
+                    } else if let jsonStart = body.range(of: Data("{\"layers\"".utf8)) {
+                        data = Data(body[jsonStart.lowerBound...])
+                    }
+                }
+            }
+        }
+        guard let jsonData = data else {
+            if let e = fetchErr { throw e }
+            throw ServerError("no data from /api/heat — is slotstream serve running on :\(port)?")
+        }
+        // Try to parse as JSON
+        guard let obj = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+              let sparse = obj["sparse"] as? [[Int]] else {
+            print(String(data: jsonData, encoding: .utf8) ?? "invalid response")
+            return
+        }
+        let total = obj["total_accesses"] as? Int ?? 0
+        print("heat: \(sparse.count) active experts of \(48*512), total accesses \(total), slots \(obj["slots"] ?? 0)")
+        print("top \(top) hottest (layer, expert, freq, last):")
+        for row in sparse.prefix(top) {
+            print(String(format: "  L%2d E%3d  freq %6d  last %6d", row[0], row[1], row[2], row[3]))
+        }
+        if ascii {
+            // 48 rows, each 512 cols downsampled to 64 for terminal (8 experts per char)
+            // Use block density: 0→' ', 1→'░', 2→'▒', 4→'▓', 8→'█'
+            let heatFull: [[Int]]? = {
+                if let dense = obj["dense"] as? [[Int]] { return dense }
+                // reconstruct dense from sparse for ascii
+                var m = Array(repeating: Array(repeating: 0, count: 512), count: 48)
+                for r in sparse { m[r[0]][r[1]] = r[2] }
+                return m
+            }()
+            if let m = heatFull {
+                let maxF = m.flatMap { $0 }.max() ?? 1
+                print("\nheatmap 48 layers x 512 experts (8 experts per char, 64 wide):")
+                for l in 0..<48 {
+                    var line = String(format: "L%02d|", l)
+                    for g in 0..<64 {
+                        let slice = m[l][g*8..<(g+1)*8]
+                        let f = slice.max() ?? 0
+                        let norm = Double(f) / Double(maxF)
+                        let ch: String
+                        if f == 0 { ch = " " }
+                        else if norm < 0.15 { ch = "░" }
+                        else if norm < 0.35 { ch = "▒" }
+                        else if norm < 0.65 { ch = "▓" }
+                        else { ch = "█" }
+                        line += ch
+                    }
+                    line += String(format: "| max %d", m[l].max() ?? 0)
+                    print(line)
+                }
+            }
+        }
+    }
+    // Minimal socket helper for sandbox fallback
+    enum SocketHelper {
+        static func connect(port: UInt16) -> Int32 {
+            let fd = socket(AF_INET, SOCK_STREAM, 0)
+            guard fd >= 0 else { return -1 }
+            var addr = sockaddr_in()
+            addr.sin_family = sa_family_t(AF_INET)
+            addr.sin_port = port.bigEndian
+            addr.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+            let rc = withUnsafePointer(to: &addr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bindPtr in
+                Foundation.connect(fd, bindPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }}
+            return rc == 0 ? fd : -1
+        }
     }
 }
 
