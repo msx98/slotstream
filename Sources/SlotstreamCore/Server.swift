@@ -694,15 +694,61 @@ public final class Server {
                 }
                 out["content"] = existing
             }
-            if let tcs = m["tool_calls"] as? [[String: Any]] { out["tool_calls"] = tcs }
+            if let tcs = m["tool_calls"] as? [[String: Any]] {
+                // OpenAI sends function.arguments as a JSON string; swift-jinja's
+                // |items filter returns [] for non-dicts, which would render every
+                // historical tool call without its parameters and teach the model
+                // to emit argument-less calls. Parse to a dict before templating.
+                out["tool_calls"] = tcs.map { tc in
+                    var t = tc
+                    if let fn = t["function"] as? [String: Any], let a = fn["arguments"] as? String,
+                        let d = (try? JSONSerialization.jsonObject(with: Data(a.utf8))) as? [String: Any]
+                    {
+                        var f = fn
+                        f["arguments"] = d
+                        t["function"] = f
+                    }
+                    return t
+                }
+            }
             if let tcid = m["tool_call_id"] as? String { out["tool_call_id"] = tcid }
             if let name = m["name"] as? String { out["name"] = name }
             return out
         }
     }
 
+    /// tool name -> parameter name -> declared JSON type, from the request's tools.
+    private static func paramTypes(from tools: [[String: Any]]?) -> [String: [String: String]] {
+        guard let tools else { return [:] }
+        var out: [String: [String: String]] = [:]
+        for t in tools {
+            guard let fn = (t["function"] as? [String: Any]) ?? (t["name"] != nil ? t : nil),
+                let name = fn["name"] as? String
+            else { continue }
+            var types: [String: String] = [:]
+            if let props = (fn["parameters"] as? [String: Any])?["properties"] as? [String: Any] {
+                for (k, v) in props {
+                    if let d = v as? [String: Any], let ty = d["type"] as? String { types[k] = ty }
+                }
+            }
+            out[name] = types
+        }
+        return out
+    }
+
+    private static func coerceParam(_ rawVal: String, declared: String?) -> Any {
+        switch declared {
+        case "number", "integer":
+            if let i = Int(rawVal) { return i }
+            if let d = Double(rawVal) { return d }
+            return rawVal
+        default:
+            return rawVal
+        }
+    }
+
     /// Parse <tool_call> XML produced by the Qwen template into OpenAI tool_calls.
-    private static func parseToolCalls(from text: String) -> (content: String, calls: [[String: Any]]?) {
+    private static func parseToolCalls(from text: String, paramTypes: [String: [String: String]] = [:]) -> (content: String, calls: [[String: Any]]?) {
         // Model emits: <tool_call><function=NAME><parameter=ARG>VAL</parameter>...</function></tool_call>
         guard text.contains("<tool_call>") else { return (text, nil) }
         let pattern = "<tool_call>\\s*<function=([^>]+)>\\s*(.*?)\\s*</function>\\s*</tool_call>"
@@ -746,9 +792,10 @@ public final class Server {
                     } else if rawVal == "null" {
                         args[key] = NSNull()
                     } else {
-                        // Keep as string. Blind Int("123")->123 breaks opencode's
-                        // string-typed tools (bash command, filePath, etc.).
-                        args[key] = rawVal
+                        // Keep strings as strings unless the schema declares the
+                        // parameter numeric (e.g. ui_tap x/y). Blind Int() here
+                        // previously broke opencode's string-typed tools.
+                        args[key] = Self.coerceParam(rawVal, declared: paramTypes[name]?[key])
                     }
                 }
             }
@@ -1013,6 +1060,7 @@ public final class Server {
         var emittedToolCalls = 0
         let toolPattern = "<tool_call>\\s*<function=([^>]+)>\\s*(.*?)\\s*</function>\\s*</tool_call>"
         let paramPattern = "<parameter=([^>]+)>\\s*(.*?)\\s*</parameter>"
+        let paramTypes = Self.paramTypes(from: tmplTools)
         let callback: ((Int, String) -> Bool)? = stream ? { _, delta in
             guard alive, !delta.isEmpty else { return alive }
             streamBuf += delta
@@ -1070,7 +1118,7 @@ public final class Server {
                             if rawVal == "true" { args[key] = true }
                             else if rawVal == "false" { args[key] = false }
                             else if rawVal == "null" { args[key] = NSNull() }
-                            else { args[key] = rawVal }
+                            else { args[key] = Self.coerceParam(rawVal, declared: paramTypes[name]?[key]) }
                         }
                     }
                     let argsJSON: String
@@ -1102,7 +1150,7 @@ public final class Server {
         let (rawText, _, stats) = engine.generate(
             promptIds: ids, params: params, visionEmbeds: visionEmbeds,
             shouldContinue: { self.peerAlive(fd) }, onToken: callback)
-        let parsed = Self.parseToolCalls(from: rawText)
+        let parsed = Self.parseToolCalls(from: rawText, paramTypes: paramTypes)
         let text: String = parsed.content
         let toolCalls = parsed.calls
         let finishReason: String = toolCalls != nil ? "tool_calls" : stats.finishReason

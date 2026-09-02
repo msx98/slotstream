@@ -31,9 +31,10 @@ ignored. A wrong model name is a 404. The only model name is
 Fields: `model`, `messages`, `stream` (default `true`), `think`
 (`true`/`false`), `options`.
 
-Messages are `{"role", "content"}` with text content; images and `tool_calls`
-are rejected. `options` accepts `temperature`, `top_p`, `top_k`, `min_p`,
-`presence_penalty`, `num_predict`, `seed`, and `stop` (a string or an array).
+Messages are `{"role", "content"}` with text content; `images` (`["base64"]`)
+is accepted for vision, `tool_calls` is rejected (`use /v1`). `options`
+accepts `temperature`, `top_p`, `top_k`, `min_p`, `presence_penalty`,
+`num_predict`, `seed`, and `stop` (a string or an array).
 
 ```bash
 curl localhost:11434/api/chat -d '{
@@ -53,8 +54,12 @@ can't be combined with `system` or `think`.
 
 Fields: `model`, `messages`, `stream`, `temperature`, `top_p`, `top_k`,
 `presence_penalty`, `max_tokens` / `max_completion_tokens`, `seed`, `stop`,
-and `stream_options` (`{"include_usage": true}`). `top_k` is an extension
-beyond the OpenAI schema; the rest is standard.
+`stream_options` (`{"include_usage": true}`), `tools`, `tool_choice`,
+`parallel_tool_calls`. `top_k` is an extension beyond the OpenAI schema;
+the rest is standard. `messages` may contain `tool_calls` (assistant) and
+`tool` role with `tool_call_id`; `tools` are forwarded to the Qwen
+`chat_template` as `<tools>` and the model’s `<tool_call>` XML is translated
+to OpenAI `tool_calls` (incrementally streamed as `delta.tool_calls`).
 
 ```python
 from openai import OpenAI
@@ -103,8 +108,11 @@ Ollama dialect: `{"error": "why"}` with 400, 404, or 501. OpenAI dialect:
 on validation failures.
 
 Deliberately unsupported, and rejected with a clear 400 rather than ignored:
-tool calling, images, JSON-schema output, logprobs, embeddings, and named
-reasoning levels for `think`.
+JSON-schema output, logprobs, embeddings, and named reasoning levels for
+`think`. Images are supported on both dialects (`images` array on `/api/chat`,
+`content:[{type:"image_url",image_url:{url}}]` on `/v1` with `vision.safetensors`);
+tool calling is supported on `/v1/chat/completions` and rejected on `/api`
+(`use /v1`).
 
 ## Limits
 
