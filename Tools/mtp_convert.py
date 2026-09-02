@@ -37,7 +37,8 @@ import urllib.request
 
 REPO = "Qwen/Qwen3.8-Flash-Next"
 REVISION = "de4b8e4d43b917e7706784d8bb445c9af86a3540"  # main @ 2026-08-27
-MODEL_DIR = os.path.expanduser("~/.slotstream/models/qwen38-flash-next-mlx-4bit")
+DEFAULT_MODEL_DIR = os.path.expanduser("~/.slotstream/models/qwen38-flash-next-mlx-4bit")
+MODEL_DIR = DEFAULT_MODEL_DIR
 STAGING = os.path.join(MODEL_DIR, ".mtp-staging")
 OUT_FILE = os.path.join(MODEL_DIR, "mtp.safetensors")
 PROV_FILE = os.path.join(MODEL_DIR, "mtp.provenance.json")
@@ -158,9 +159,17 @@ def sha256_file(path: str) -> str:
 
 
 def main() -> None:
+    global MODEL_DIR, STAGING, OUT_FILE, PROV_FILE
     ap = argparse.ArgumentParser()
+    ap.add_argument("model_dir", nargs="?", default=DEFAULT_MODEL_DIR,
+                    help="model directory containing the pinned weights "
+                         "(default: %(default)s)")
     ap.add_argument("--staging-only", action="store_true", help="download, skip convert")
     args = ap.parse_args()
+    MODEL_DIR = os.path.abspath(args.model_dir)
+    STAGING = os.path.join(MODEL_DIR, ".mtp-staging")
+    OUT_FILE = os.path.join(MODEL_DIR, "mtp.safetensors")
+    PROV_FILE = os.path.join(MODEL_DIR, "mtp.provenance.json")
 
     os.makedirs(STAGING, exist_ok=True)
 

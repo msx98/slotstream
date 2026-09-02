@@ -168,6 +168,65 @@ public struct Sampler {
     }
 }
 
+/// Windowed decode meter. Each "round" is a batch of emitted tokens: one
+/// per plain-loop iteration, or one verify-pass burst in the MTP path.
+/// The live decode line uses the last <= `window` emitted tokens instead
+/// of the whole-run average, so the rate the user sees matches what the
+/// generator is actually doing right now rather than the average across a
+/// long first-pass.
+fileprivate final class DecodeMeter {
+    let window: Int
+    private var timestamps: [TimeInterval] = []
+    private var cumEmitted: [Int] = []      // emitted count at end of each round
+    private var cumDrafted: [Int] = []      // cumulative drafted tokens
+    private var cumAccepted: [Int] = []     // cumulative accepted drafts
+    private let t0: TimeInterval
+
+    init(window: Int, start: Date) {
+        self.window = max(1, window)
+        self.t0 = start.timeIntervalSinceReferenceDate
+    }
+
+    func record(emitted: Int, drafted: Int = 0, accepted: Int = 0) {
+        let now = Date().timeIntervalSinceReferenceDate
+        timestamps.append(now)
+        cumEmitted.append((cumEmitted.last ?? 0) + emitted)
+        cumDrafted.append((cumDrafted.last ?? 0) + drafted)
+        cumAccepted.append((cumAccepted.last ?? 0) + accepted)
+    }
+
+    /// (tps, draftedInWindow, acceptedInWindow, emittedInWindow, mtpOn)
+    func snapshot() -> (tps: Double, drafted: Int, accepted: Int, emitted: Int, mtp: Bool) {
+        let n = cumEmitted.count
+        guard n > 0 else { return (0, 0, 0, 0, false) }
+        let totalEmitted = cumEmitted[n - 1]
+        // Walk back from the newest round, accumulating emitted until adding
+        // the next round would push the window past `window`. Always include
+        // the newest round so the meter is never silent.
+        var e = 0
+        var d = 0
+        var a = 0
+        var firstIdx = n - 1
+        for i in stride(from: n - 1, through: 0, by: -1) {
+            let delta = totalEmitted - (i > 0 ? cumEmitted[i - 1] : 0)
+            if e > 0 && e + delta > window { break }
+            e += delta
+            d += i > 0 ? cumDrafted[i] - cumDrafted[i - 1] : cumDrafted[i]
+            a += i > 0 ? cumAccepted[i] - cumAccepted[i - 1] : cumAccepted[i]
+            firstIdx = i
+            if e >= window { break }
+        }
+        let span: TimeInterval
+        if firstIdx == 0 {
+            span = timestamps[n - 1] - t0
+        } else {
+            span = timestamps[n - 1] - timestamps[firstIdx - 1]
+        }
+        let tps = span > 0 ? Double(e) / span : 0
+        return (tps, d, a, e, cumDrafted.last ?? 0 > 0)
+    }
+}
+
 public final class Generator {
     public let model: Qwen4ExpModel
     /// Tokens per prefill pass. Bigger is faster on long prompts: a chunk
@@ -493,6 +552,36 @@ extension Generator {
             pending = tok
         }
 
+        // Throttled decode progress: mirrors the plain-decode loop's log so
+        // MTP and plain runs read the same way. The MTP line also surfaces
+        // the live draft acceptance rate (accepted / drafted) and the verify
+        // pass count — the metrics the speculative path actually moves on.
+        // Both lines report a windowed tok/s over the last <= 50 emitted
+        // tokens (instead of the whole-run average), so the rate tracks what
+        // the generator is doing right now.
+        let t0 = Date()
+        let meter = DecodeMeter(window: 50, start: t0)
+        if out.count > 0 { meter.record(emitted: 1) }   // the first token, if any
+        var lastLog = t0
+        func logProgress() {
+            let s = meter.snapshot()
+            let elapsed = -t0.timeIntervalSinceNow
+            if s.mtp {
+                let acc = s.drafted > 0 ? 100.0 * Double(s.accepted) / Double(s.drafted) : 0
+                FileHandle.standardError.write(String(
+                    format: "decode %d/%d  %.1f tok/s (last %d)  mtp %d/%d accepted (%.0f%%), %d verify passes  elapsed %.1fs\n",
+                    out.count, params.maxTokens, s.tps, s.emitted,
+                    s.accepted, s.drafted, acc, stats.verifyPasses, elapsed
+                ).data(using: .utf8)!)
+            } else {
+                FileHandle.standardError.write(String(
+                    format: "decode %d/%d  %.1f tok/s (last %d)  elapsed %.1fs\n",
+                    out.count, params.maxTokens, s.tps, s.emitted, elapsed
+                ).data(using: .utf8)!)
+            }
+        }
+        logProgress()
+
         while let p = pending, out.count < params.maxTokens {
             if let keepGoing = shouldContinue, !keepGoing() { reason = "stop"; break }
             let ck = state.checkpoint()
@@ -536,6 +625,8 @@ extension Generator {
                 break
             }
             stats.acceptedDrafts += good
+            meter.record(emitted: good + (nextPending != nil ? 1 : 0),
+                         drafted: drafts.count, accepted: good)
 
             // ---- reconcile the state with what was actually kept
             let keep = [p] + Array(drafts[0 ..< good])
@@ -559,8 +650,33 @@ extension Generator {
             precondition(
                 mtpState.offset == state.tokenCount - 1,
                 "mtp cache misaligned: \(mtpState.offset) entries at \(state.tokenCount) tokens")
+            // Throttled progress: every 16 tokens or 1s, like the plain loop.
+            if out.count % 16 == 0 || Date().timeIntervalSince(lastLog) > 1.0 {
+                logProgress()
+                lastLog = Date()
+            }
             pending = nextPending
             if reason == "stop" { break }
+        }
+        // Final decode summary (the MTP path doesn't take the plain loop's
+        // "decode done" branch, so write it here).
+        if out.count > 0 {
+            let elapsed = -t0.timeIntervalSinceNow
+            let s = meter.snapshot()
+            let tps = elapsed > 0 ? Double(out.count) / elapsed : 0
+            let acc = s.mtp && s.drafted > 0 ? 100.0 * Double(s.accepted) / Double(s.drafted) : 0
+            if s.mtp {
+                FileHandle.standardError.write(String(
+                    format: "decode done: %d tokens in %.1fs (%.1f tok/s, %.1f over last %d)  mtp %d/%d accepted (%.0f%%), %d verify passes  reason=%@\n",
+                    out.count, elapsed, tps, s.tps, s.emitted,
+                    s.accepted, s.drafted, acc, stats.verifyPasses, reason
+                ).data(using: .utf8)!)
+            } else {
+                FileHandle.standardError.write(String(
+                    format: "decode done: %d tokens in %.1fs (%.1f tok/s, %.1f over last %d)  reason=%@\n",
+                    out.count, elapsed, tps, s.tps, s.emitted, reason
+                ).data(using: .utf8)!)
+            }
         }
     }
 }

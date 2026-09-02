@@ -1061,6 +1061,7 @@ public final class Server {
         // raw XML and avoids the post-hoc duplicate that required suppression.
         var streamBuf = ""
         var reasoningSent = 0
+        var contentSent = 0
         var emittedToolCalls = 0
         let toolPattern = "<tool_call>\\s*<function=([^>]+)>\\s*(.*?)\\s*</function>\\s*</tool_call>"
         let paramPattern = "<parameter=([^>]+)>\\s*(.*?)\\s*</parameter>"
@@ -1087,17 +1088,22 @@ public final class Server {
                     }
                 }
                 // Anything after </think> (or before any tool tag in a tool-only reply)
-                // is real content; stream subsequent deltas as content.
+                // is real content; stream only the newly arrived tail bytes so clients
+                // don't see the same suffix duplicated on every delta.
                 let after = streamBuf.index(after: r.upperBound)
                 let tail = String(streamBuf[after...])
-                if !tail.isEmpty {
-                    let obj: [String: Any] = [
-                        "id": rid, "object": "chat.completion.chunk",
-                        "created": Int(Date().timeIntervalSince1970), "model": self.engine.modelName,
-                        "choices": [["index": 0, "delta": ["content": tail], "finish_reason": NSNull()]],
-                    ]
-                    let data = try! JSONSerialization.data(withJSONObject: obj)
-                    alive = self.chunk(fd, Data("data: ".utf8) + data + Data("\n\n".utf8))
+                if tail.count > contentSent {
+                    let toSend = String(tail.dropFirst(contentSent))
+                    if !toSend.isEmpty {
+                        let obj: [String: Any] = [
+                            "id": rid, "object": "chat.completion.chunk",
+                            "created": Int(Date().timeIntervalSince1970), "model": self.engine.modelName,
+                            "choices": [["index": 0, "delta": ["content": toSend], "finish_reason": NSNull()]],
+                        ]
+                        let data = try! JSONSerialization.data(withJSONObject: obj)
+                        alive = self.chunk(fd, Data("data: ".utf8) + data + Data("\n\n".utf8))
+                        contentSent = tail.count
+                    }
                 }
             } else if let r = streamBuf.range(of: "<tool_call>") {
                 // Tool replies may not include </think>; stream the prefix as
