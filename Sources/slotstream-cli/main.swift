@@ -208,7 +208,11 @@ struct ModelOptions: ParsableArguments {
 
     /// Resolve knobs -> plan, print the announce, return it. Also the first
     /// place a stranger hits with no weights — offer the download right there.
-    func announcedPlan(maxContext: Int = ContextPolicy.maxTokens) throws -> MemoryPlan {
+    /// `poolFloorSlots` is the `--pool-floor-gb` override (run only): nil keeps
+    /// every plan number byte-identical.
+    func announcedPlan(
+        maxContext: Int = ContextPolicy.maxTokens, poolFloorSlots: Int? = nil
+    ) throws -> MemoryPlan {
         if diskKVCacheSize != nil, let gb = kvCacheSizeGB, !gb.isFinite || gb <= 0 {
             throw PlanError("--disk-kv-cache-size must be a size greater than 0 (MB, or with a G/GB or M/MB suffix) (got \(diskKVCacheSize ?? ""))")
         }
@@ -239,7 +243,7 @@ struct ModelOptions: ParsableArguments {
             ramPercent: maxRAMPercent,
             mtp: mtpMode(), mtpAvailable: MTPWeights.present(modelDir: modelURL),
             vision: visionMode(), visionAvailable: visionAvailable(),
-            maxContextTokens: maxContext,
+            maxContextTokens: maxContext, poolFloorSlots: poolFloorSlots,
             profile: profile)
         FileHandle.standardError.write((plan.banner() + "\n").data(using: .utf8)!)
         return plan
@@ -338,6 +342,33 @@ struct Run: ParsableCommand {
     @Flag(help: "Greedy sampling (deterministic)") var greedy = false
     @Flag(help: "Raw prompt (no chat template)") var raw = false
     @Flag(help: "Enable thinking mode") var think = false
+    @Flag(
+        help: ArgumentHelp(
+            "Commit the whole expert pool to resident pages at boot.",
+            discussion: """
+                After boot the full planned expert pool is written in place so \
+                every backing page is committed to the OS at once: process RSS \
+                is flat from the first token instead of growing as slots are \
+                first filled during decode. The amount is the plan's pool \
+                target and is never clamped — if the machine lacks the memory, \
+                the OS pages. Without the flag the boot is byte-identical to \
+                before.
+                """))
+    var preallocate = false
+    @Option(
+        name: .customLong("pool-floor-gb"),
+        help: ArgumentHelp(
+            "Explicit pool floor in GB: lower the planner's minimum expert pool.",
+            discussion: """
+                The floor exists because a Qwen prefill chunk can pin every \
+                slot. DS4 prefill never touches the pool — its decode pins \
+                only the 6 routed experts of one layer per call — so this is \
+                the escape hatch that lets DS4 run in a small total budget. \
+                Decode will stream nearly every expert from SSD and run in the \
+                single digits of tok/s. Never clamped; cannot go below the \
+                one-call decode pin (6 slots here).
+                """))
+    var poolFloorGB: Double?
     @Option(
         name: .customLong("image"),
         help: ArgumentHelp(
@@ -352,12 +383,43 @@ struct Run: ParsableCommand {
         if raw, !images.isEmpty {
             throw PlanError("--raw has no chat template to place an image in; drop one of them")
         }
+        // --pool-floor-gb -> slots, validated against the profile before the
+        // planner sees it. The totalRecords comparison happens on the Double:
+        // an attacker-sized Double converted to Int traps.
+        var poolFloorSlots: Int? = nil
+        if let g = poolFloorGB {
+            guard g.isFinite, g > 0 else {
+                throw PlanError("--pool-floor-gb must be a finite number > 0")
+            }
+            let prof = model.profile
+            guard g < prof.gb(prof.totalRecords) else {
+                throw PlanError(String(
+                    format: "--pool-floor-gb %.2f GB is above the whole expert set "
+                        + "(%d slots = %.1f GB) — drop the flag and let the planner size the pool",
+                    g, prof.totalRecords, prof.gb(prof.totalRecords)))
+            }
+            let slots = Int(g * 1e9 / prof.recordBytes)
+            guard slots >= prof.decodePinSlots else {
+                throw PlanError(String(
+                    format: "--pool-floor-gb %.2f GB is %d slots, below the hard floor of %d: "
+                        + "one decode step pins %d experts in a single pool.ensure call, and "
+                        + "fewer slots than that traps the pool's eviction scan",
+                    g, slots, prof.decodePinSlots, prof.decodePinSlots))
+            }
+            poolFloorSlots = slots
+        }
         let sem = DispatchSemaphore(value: 0)
         var result: Result<Void, Error> = .success(())
-        let plan = try model.announcedPlan()
+        let plan = try model.announcedPlan(poolFloorSlots: poolFloorSlots)
         Task {
             do {
                 let engine = try await Engine(modelDir: model.modelURL, plan: plan)
+                if preallocate {
+                    let gb = Double(engine.model.pool.preallocate()) / 1e9
+                    FileHandle.standardError.write(String(
+                        format: "preallocate: %.1f GB expert pool (the plan's pool target) "
+                            + "committed to resident pages at boot\n", gb).data(using: .utf8)!)
+                }
                 let ids: [Int]
                 var vision: VisionPrompt?
                 if raw {
@@ -387,11 +449,27 @@ struct Run: ParsableCommand {
                 var params: SampleParams = greedy ? .greedy : (think ? .thinking : .instruct)
                 params.maxTokens = maxTokens
                 let t0 = Date()
+                // One stderr line per generated token; the count lives here
+                // because onToken delivers decoded deltas, not tokens.
+                var tokenCount = 0
                 let (_, _, stats) = engine.generate(
                     promptIds: ids, params: params, vision: vision, onToken: { _, delta in
                     fputs(delta, stdout)
                     fflush(stdout)
                     return true
+                }, onNewToken: { tok in
+                    tokenCount += 1
+                    // Id + decoded text per sampled token: the ids are what
+                    // the DS4 router trace and DS4Trace sel0 lines key on, so
+                    // a nonsense decode can be bisected straight from the log.
+                    // decode(ids:) is a standalone single-token decode — a
+                    // split multibyte character shows U+FFFD until its tail
+                    // arrives, which is the honest state of that byte stream.
+                    let tokenText = engine.tokenizer.decode(tokens: [tok])
+                    let hex = String(tok, radix: 16)
+                    FileHandle.standardError.write(Data(
+                        "[TOKEN] \(tokenCount) token_hex=\(hex) token='\(tokenText)'\n"
+                            .utf8))
                 })
                 print("")
                 let hs = String(format: "%.3f", stats.expertHitRate)

@@ -306,6 +306,11 @@ public final class Engine {
         if plan?.simulated == true { throw SlotstreamError.simulatedDeviceCannotLoad }
         self.modelDir = modelDir
         self._plan = plan
+        // Boot milestones wrap the whole init; the per-action pairs below nest
+        // inside, so a polled log shows both where boot is and how long it all
+        // took. A throw mid-boot leaves the last START in the log — which is
+        // exactly where boot died.
+        let tBoot = Milestone.start("engine ready")
         // Model dispatch: a directory whose GGUF declares the deepseek4
         // architecture builds the DS4 path (config → weights → expert store →
         // pool, all from the GGUF); everything else is the pinned Qwen
@@ -366,8 +371,15 @@ public final class Engine {
             } else if let p = plan, p.expectedPeakGB <= 12 {
                 generator.prefillCacheLimit = 512 << 20
             }
+            // One milestone covers the GGUF tokenizer export (or its reuse
+            // check) and the swift-transformers load: to a poller it is one
+            // wait, and the boot struct no longer needs to carry the folder.
+            let tTokenizer = Milestone.start("load tokenizer")
+            let tokenizerDir = try Self.ensureDS4Tokenizer(
+                modelDir: modelDir, gguf: boot.gguf, cfg: boot.cfg)
             self.tokenizer = try await AutoTokenizer.from(
-                modelFolder: URL(fileURLWithPath: boot.tokenizerDir))
+                modelFolder: URL(fileURLWithPath: tokenizerDir))
+            Milestone.end("load tokenizer", tTokenizer)
             var eos: Set<Int> = []
             if let e = boot.gguf.kv("tokenizer.ggml.eos_token_id")?.intValue { eos.insert(e) }
             if let e = tokenizer.eosTokenId { eos.insert(e) }
@@ -382,7 +394,9 @@ public final class Engine {
             // ---- Qwen (the pinned checkpoint; this path is unchanged)
             self.modelName = "qwen3.8-flash-next:4bit"
             self.ds4Info = nil
+            let tIndex = Milestone.start("read checkpoint index")
             let index = try CheckpointIndex(dir: modelDir)
+            Milestone.end("read checkpoint index", tIndex)
             let qwen = try Qwen4ExpModel(index: index, poolSlots: poolSlots)
             self.model = .qwen(qwen)
             try qwen.validate()
@@ -402,7 +416,9 @@ public final class Engine {
             } else if let p = plan, p.expectedPeakGB <= 12 {
                 generator.prefillCacheLimit = 512 << 20
             }
+            let tTokenizer = Milestone.start("load tokenizer")
             self.tokenizer = try await AutoTokenizer.from(modelFolder: modelDir)
+            Milestone.end("load tokenizer", tTokenizer)
             var eos: Set<Int> = [index.config.eosTokenId]
             if let e = tokenizer.eosTokenId { eos.insert(e) }
             // generation_config may list several
@@ -415,6 +431,7 @@ public final class Engine {
             self.eosIds = eos
         }
         publishPoolSnapshot()
+        Milestone.end("engine ready", tBoot)
         let banner = "engine ready in \(String(format: "%.1f", -t0.timeIntervalSinceNow))s: "
             + "expert cache ~\(String(format: "%.0f", model.pool.slotsPerLayer))/\(model.expertsPerLayer) per layer "
             + "(\(model.pool.slots) global slots = \(String(format: "%.1f", Double(model.pool.poolBytes) / 1e9)) GB), "
@@ -458,11 +475,13 @@ public final class Engine {
     }
 
     /// Everything the DS4 boot needs, built without touching `self` (the init
-    /// is async and must not read partially initialized state).
+    /// is async and must not read partially initialized state). The tokenizer
+    /// export lives with the tokenizer load in the init's own milestone, so
+    /// the boot carries the config the export needs instead of a folder.
     private struct DS4Boot {
         let model: DS4Model
         let info: DS4ModelInfo
-        let tokenizerDir: String
+        let cfg: DS4Config
         let gguf: GGUFFile
     }
 
@@ -477,10 +496,22 @@ public final class Engine {
         // The Geometry.check analog: DS4Config.init validates the exact Flash
         // geometry (and, with the gguf argument, the tensor directory) and
         // rejects anything else with a --model-style message.
+        let tConfig = Milestone.start("ds4 config")
         let cfg = try DS4Config(gguf: gguf)
+        Milestone.end("ds4 config", tConfig)
+        // Neither loader prints a byte total up front, so the trunk milestone
+        // carries no size (a static "8.8 GB" would be a guess).
+        let tTrunk = Milestone.start("load resident trunk")
         let weights = try DS4Weights(ggufPath: ggufPath, cfg: cfg)
+        Milestone.end("load resident trunk", tTrunk)
+        let tExperts = Milestone.start("open expert store")
         let experts = try DS4ExpertStore(ggufPath: ggufPath, cfg: cfg)
+        Milestone.end("open expert store", tExperts)
+        // The pool target the plan chose, in the same figure the banner prints.
+        let poolGB = String(format: "%.1f", Double(poolSlots) * Double(experts.recordBytes) / 1e9)
+        let tPool = Milestone.start("build slot pool (\(poolGB) GB)")
         let pool = SlotPool(slots: poolSlots, source: .ds4(experts))
+        Milestone.end("build slot pool (\(poolGB) GB)", tPool)
         let model = try DS4Model(cfg: cfg, weights: weights, experts: experts, pool: pool)
         let info = DS4ModelInfo(
             name: gguf.kv("general.name")?.stringValue,
@@ -488,8 +519,7 @@ public final class Engine {
             sourceRevision: gguf.kv("general.source.revision")?.stringValue,
             sourceURL: gguf.kv("general.source.url")?.stringValue,
             ggufPath: ggufPath)
-        let tokenizerDir = try ensureDS4Tokenizer(modelDir: modelDir, gguf: gguf, cfg: cfg)
-        return DS4Boot(model: model, info: info, tokenizerDir: tokenizerDir, gguf: gguf)
+        return DS4Boot(model: model, info: info, cfg: cfg, gguf: gguf)
     }
 
     /// The folder swift-transformers loads the DS4 tokenizer from.
@@ -950,7 +980,8 @@ public final class Engine {
     public func generate(
         promptIds: [Int], params: SampleParams, vision: VisionPrompt? = nil,
         shouldContinue: (() -> Bool)? = nil,
-        onToken: ((Int, String) -> Bool)? = nil
+        onToken: ((Int, String) -> Bool)? = nil,
+        onNewToken: ((Int) -> Void)? = nil
     ) -> (text: String, ids: [Int], stats: GenStats) {
         lock.lock()
         defer { lock.unlock() }
@@ -1024,9 +1055,13 @@ public final class Engine {
             return feed(piece, final: false, tok: tok)
         }
 
-        let needsIncrementalDecode = onToken != nil || !stops.isEmpty
+        let needsIncrementalDecode = onToken != nil || onNewToken != nil || !stops.isEmpty
         let tokenHandler: ((Int) -> Bool)? = needsIncrementalDecode ? { tok in
             lastTok = tok
+            // Exactly one event per sampled token, before detokenization can
+            // buffer it or merge it into a later delta — `onToken` sees
+            // deltas, which do not map one-to-one onto tokens.
+            onNewToken?(tok)
             pendingIds.append(tok)
             let ok = flushStablePrefix(tok)
             if !ok, !stopFound { clientGone = true }

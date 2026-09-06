@@ -8,6 +8,13 @@ Key modelling detail: the cache is GLOBAL across layers, keyed by
 
 Usage:
   python cachesim.py bench/traces/*.npz
+
+The geometry defaults are the Qwen checkpoint's (48 layers x 512 experts,
+2.7648 MB/record). For other models pass flags, e.g. DS4-V4-Flash
+(43 x 256, record = 3 tensors of 2048/4096 rows MXFP4 = 13.369 MB,
+= expert bytes / (layers x experts)):
+  python cachesim.py --layers=43 --experts=256 --rec-mb=13.369 \
+      --out=/tmp/ds4_locality.json ds4_router.npz
 """
 import sys, json, glob
 import numpy as np
@@ -16,6 +23,7 @@ from collections import OrderedDict, defaultdict
 REC_MB = 2.7648
 N_LAYERS, N_EXPERTS = 48, 512
 TOTAL_RECORDS = N_LAYERS * N_EXPERTS
+OUT_PATH = "bench/locality/summary.json"
 
 
 class LRU:
@@ -162,7 +170,21 @@ def analyze(name, arr, caps_gb):
 
 
 if __name__ == "__main__":
-    files = sys.argv[1:] or sorted(glob.glob("bench/traces/*.npz"))
+    # --key=value flags override the geometry/output path; everything else
+    # is a trace file. Defaults keep the Qwen behavior byte for byte.
+    for a in sys.argv[1:]:
+        if a.startswith("--") and "=" in a:
+            k, v = a[2:].split("=", 1)
+            if k == "layers":
+                N_LAYERS = int(v)
+            elif k == "experts":
+                N_EXPERTS = int(v)
+            elif k == "rec-mb":
+                REC_MB = float(v)
+            elif k == "out":
+                OUT_PATH = v
+    TOTAL_RECORDS = N_LAYERS * N_EXPERTS
+    files = [a for a in sys.argv[1:] if not a.startswith("--")] or sorted(glob.glob("bench/traces/*.npz"))
     if not files:
         print("no traces given"); sys.exit(1)
     caps = [0.5, 1, 2, 5.5, 10.5, 16, 27, 36, 56, 68]
@@ -176,6 +198,6 @@ if __name__ == "__main__":
             if arr.ndim != 3:
                 continue
             out[f"{f}:{k}"] = analyze(f"{f.split('/')[-1]}:{k}", arr, caps)
-    with open("bench/locality/summary.json", "w") as fh:
+    with open(OUT_PATH, "w") as fh:
         json.dump(out, fh, indent=2)
-    print("\nwrote bench/locality/summary.json")
+    print(f"\nwrote {OUT_PATH}")

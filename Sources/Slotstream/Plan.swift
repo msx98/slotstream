@@ -69,6 +69,15 @@ public struct GeometryProfile: Sendable, Equatable {
     /// Bytes per expert record, as a Double so the GB math matches Geometry's.
     public let recordBytes: Double
     public let floorSlots: Int
+    /// The largest single `ensure` call a decode step makes — the pool's hard
+    /// lower bound, independent of the prefill rationale `floorSlots` carries:
+    /// `SlotPool.ensure` chooses victims for a whole call up front, so misses
+    /// beyond the slot count trip `victim()`'s "slot pool exhausted"
+    /// precondition instead of evicting mid-call. Qwen: 10 routed experts per
+    /// token (`Geometry.check` validates topK == 10); DS4: 6
+    /// (`expertUsedCount`, validated by DS4Config). `--pool-floor-gb` may not
+    /// go below it.
+    public let decodePinSlots: Int
     /// Non-pool process footprint (resident weights + runtime + a full active
     /// context), charged before the pool is sized.
     public let fixedFootprintGB: Double
@@ -81,6 +90,7 @@ public struct GeometryProfile: Sendable, Equatable {
         expertsPerLayer: Geometry.expertsPerLayer,
         recordBytes: Geometry.recordBytes,
         floorSlots: Geometry.floorSlots,
+        decodePinSlots: 10,
         fixedFootprintGB: 5.3,
         contextBytesPerToken: PrefixCache.bytesPerToken)
 
@@ -96,6 +106,7 @@ public struct GeometryProfile: Sendable, Equatable {
         expertsPerLayer: 256,
         recordBytes: 13_369_344,
         floorSlots: 256,
+        decodePinSlots: 6,
         fixedFootprintGB: 11.0,
         contextBytesPerToken: 5_878)
 
@@ -105,10 +116,15 @@ public struct GeometryProfile: Sendable, Equatable {
     public var gbPerExpertPerLayer: Double { Double(layers) * recordBytes / 1e9 }
 
     /// Same conversion as `Geometry.slotsForPoolGB`, on this profile's constants.
-    public func slotsForPoolGB(_ poolGB: Double) -> Int {
-        guard poolGB.isFinite else { return poolGB > 0 ? totalRecords : floorSlots }
+    /// `floorSlots` replaces the profile's floor for `--pool-floor-gb`: pools
+    /// at or below the (smaller) override floor clamp to it, so a raw GB ask
+    /// converts honestly instead of being lifted to the prefill floor. nil
+    /// keeps the conversion exactly as it was.
+    public func slotsForPoolGB(_ poolGB: Double, floorSlots floor: Int? = nil) -> Int {
+        let floor = floor ?? self.floorSlots
+        guard poolGB.isFinite else { return poolGB > 0 ? totalRecords : floor }
         if poolGB >= gb(totalRecords) { return totalRecords }
-        if poolGB <= gb(floorSlots) { return floorSlots }
+        if poolGB <= gb(floor) { return floor }
         return Int(poolGB * 1e9 / recordBytes)
     }
 }
@@ -586,11 +602,14 @@ public enum Planner {
     }
     /// Smallest honest total-memory target: floor pool + footprint + margin.
     /// The Qwen shorthand `minMemoryGB` stays for the existing callers and the
-    /// doctor table; DS4 passes its profile explicitly.
+    /// doctor table; DS4 passes its profile explicitly. `floorSlots` is the
+    /// `--pool-floor-gb` override — the minimum drops with it, which is the
+    /// override's whole point.
     public static var minMemoryGB: Double { minMemoryGBFor(.qwen) }
 
-    public static func minMemoryGBFor(_ profile: GeometryProfile) -> Double {
-        ((profile.gb(profile.floorSlots) + profile.fixedFootprintGB + planningMarginGB) * 10)
+    public static func minMemoryGBFor(_ profile: GeometryProfile, floorSlots: Int? = nil) -> Double {
+        let floor = floorSlots ?? profile.floorSlots
+        return ((profile.gb(floor) + profile.fixedFootprintGB + planningMarginGB) * 10)
             .rounded(.up) / 10
     }
 
@@ -769,11 +788,13 @@ public enum Planner {
         targetGB - profile.fixedFootprintGB - planningMarginGB
     }
 
-    public static func slotsForTarget(_ targetGB: Double, profile: GeometryProfile = .qwen) -> Int {
+    public static func slotsForTarget(
+        _ targetGB: Double, profile: GeometryProfile = .qwen, floorSlots: Int? = nil
+    ) -> Int {
         let budget = poolBudgetGB(targetGB, profile: profile)
         let pool = budget - prefillCostGB(prefillChunkFor(poolBudgetGB: budget, profile: profile), profile: profile)
             - prefixCacheGB(poolBudgetGB: budget, profile: profile)
-        return profile.slotsForPoolGB(pool)
+        return profile.slotsForPoolGB(pool, floorSlots: floorSlots)
     }
 
     /// Resolve the knobs. Precedence: --experts-per-layer > --pool-gb >
@@ -801,6 +822,7 @@ public enum Planner {
         vision: VisionMode = .auto, visionAvailable: Bool = false,
         maxContextTokens: Int = ContextPolicy.maxTokens,
         simulated: Bool = false,
+        poolFloorSlots: Int? = nil,
         profile: GeometryProfile = .qwen
     ) throws -> MemoryPlan {
         if let why = ContextPolicy.validationError(maxContextTokens) { throw PlanError(why) }
@@ -810,6 +832,12 @@ public enum Planner {
         let ws = workingSetGB ?? deviceWorkingSetGB()
         let avail = availableGB ?? deviceAvailableGB()
         let pct = ramPercent ?? defaultRAMPercent
+        // The floor this plan speaks in: profile.floorSlots unless
+        // --pool-floor-gb overrode it. The minimum, the memory-gb guard, and
+        // every floor note follow, so one plan never quotes two floors.
+        // nil keeps every number byte-identical to the unoverridden plan.
+        let minGB = minMemoryGBFor(profile, floorSlots: poolFloorSlots)
+        let floor = poolFloorSlots ?? profile.floorSlots
         guard ram.isFinite, ram > 0 else {
             throw PlanError("RAM must be a finite number > 0")
         }
@@ -867,8 +895,12 @@ public enum Planner {
                 ?? profile.gb(slots)
             let chunk = prefillChunkFor(poolBudgetGB: budgetForCaches, profile: profile)
             let capped = min(slots, profile.totalRecords)
-            let floored = max(capped, profile.floorSlots)
-            if floored > capped {
+            let floored = max(capped, floor)
+            if poolFloorSlots != nil {
+                notes.append(String(
+                    format: "pool floor override: %d slots (~%.1f/layer, %.2f GB) — decode will stream nearly every expert from SSD; expect tok/s in the single digits",
+                    floored, profile.perLayer(floored), profile.gb(floored)))
+            } else if floored > capped {
                 notes.append(String(
                     format: "raised to the floor of %d slots (~%.0f/layer): below it a prefill chunk can pin every slot",
                     profile.floorSlots, profile.perLayer(profile.floorSlots)))
@@ -923,7 +955,7 @@ public enum Planner {
         }
         if let m = memoryGB {
             guard m.isFinite else { throw PlanError("--memory-gb must be finite") }
-            guard m >= minMemoryGBFor(profile) else {
+            guard m >= minGB else {
                 // The Qwen wording is load-bearing text gates may match; only
                 // DS4 (which has no n-gram cache) says "runtime".
                 let footprint: String
@@ -933,14 +965,14 @@ public enum Planner {
                 }
                 throw PlanError(String(
                     format: "--memory-gb %.1f is below the minimum %.1f GB (floor cache of ~%.0f experts/layer = %.1f GB pool, plus the %.1f GB fixed footprint of %@, plus %.1f GB margin)",
-                    m, minMemoryGBFor(profile), profile.perLayer(profile.floorSlots),
-                    profile.gb(profile.floorSlots), profile.fixedFootprintGB,
+                    m, minGB, profile.perLayer(floor),
+                    profile.gb(floor), profile.fixedFootprintGB,
                     footprint, planningMarginGB))
             }
             if m > ws {
                 notes.append(String(
                     format: "target %.1f GB exceeds the %.1f GB Metal working set; the OS may page — auto would pick %.1f GB here",
-                    m, ws, max(minMemoryGBFor(profile), autoTargetGB(ramGB: ram, workingSetGB: ws, ramPercent: pct))))
+                    m, ws, max(minGB, autoTargetGB(ramGB: ram, workingSetGB: ws, ramPercent: pct))))
             }
             if let a = avail, m > a {
                 notes.append(String(
@@ -949,17 +981,19 @@ public enum Planner {
             }
             var mtpOn = resolveMTP(
                 slotsAfterCharge: slotsForTarget(
-                    max(m - mtpResidentGB - contextCharge, minMemoryGBFor(profile)),
-                    profile: profile))
-            if mtpOn, m - mtpResidentGB - contextCharge < minMemoryGBFor(profile) {
+                    max(m - mtpResidentGB - contextCharge, minGB),
+                    profile: profile, floorSlots: poolFloorSlots))
+            if mtpOn, m - mtpResidentGB - contextCharge < minGB {
                 if mtp == .on {
                     throw PlanError(String(
                         format: "--memory-gb %.1f cannot fit the %.1f GB draft head above the %.1f GB minimum — raise the target or drop --mtp on",
-                        m, mtpResidentGB, minMemoryGBFor(profile)))
+                        m, mtpResidentGB, minGB))
                 }
                 mtpOn = false
             }
-            let slots = slotsForTarget(m - (mtpOn ? mtpResidentGB : 0) - contextCharge, profile: profile)
+            let slots = slotsForTarget(
+                m - (mtpOn ? mtpResidentGB : 0) - contextCharge,
+                profile: profile, floorSlots: poolFloorSlots)
             return finish(.memoryGB, slots, target: m, mtpOn: mtpOn)
         }
 
@@ -981,11 +1015,11 @@ public enum Planner {
         var mtpOn = false
         if mtpWanted {
             let (rawM, _) = autoRaw(ceilingGB: usefulCeilingGB + mtpResidentGB)
-            let targetM = max(minMemoryGBFor(profile), rawM)
+            let targetM = max(minGB, rawM)
             let charged = targetM - mtpResidentGB - contextCharge
-            mtpOn = charged >= minMemoryGBFor(profile)
+            mtpOn = charged >= minGB
                 && (mtp == .on
-                    || profile.perLayer(slotsForTarget(charged, profile: profile)) >= mtpAutoFloorPerLayer)
+                    || profile.perLayer(slotsForTarget(charged, profile: profile, floorSlots: poolFloorSlots)) >= mtpAutoFloorPerLayer)
         }
         // `ceiling` is what this machine's auto would pick unclamped (the
         // notes below compare against it); the knee itself rises by the
@@ -995,17 +1029,17 @@ public enum Planner {
             ramGB: ram, workingSetGB: ws, ramPercent: pct, ceilingGB: kneeGB)
         let raw: Double
         (raw, clamped) = autoRaw(ceilingGB: kneeGB)
-        let target = max(minMemoryGBFor(profile), raw)
-        if mtpOn, target - mtpResidentGB - contextCharge < minMemoryGBFor(profile) { mtpOn = false }
+        let target = max(minGB, raw)
+        if mtpOn, target - mtpResidentGB - contextCharge < minGB { mtpOn = false }
         // Exactly one note tells the story of why the target is what it is.
-        if raw < minMemoryGBFor(profile), ceiling < minMemoryGBFor(profile) {
+        if raw < minGB, ceiling < minGB {
             notes.append(String(
                 format: "this machine (%.0f GB RAM) is below the comfortable minimum — running at the %.1f GB floor; expect slow decode and close other apps",
-                ram, minMemoryGBFor(profile)))
-        } else if raw < minMemoryGBFor(profile) {
+                ram, minGB))
+        } else if raw < minGB {
             notes.append(String(
                 format: "only %.1f GB of %.0f GB RAM is reclaimable right now — running at the %.1f GB floor anyway; expect heavy paging until other apps release memory",
-                avail ?? 0, ram, minMemoryGBFor(profile)))
+                avail ?? 0, ram, minGB))
         } else if clamped {
             notes.append(String(
                 format: "only %.1f GB of %.0f GB RAM is reclaimable right now (other apps hold the rest) — sized down from the usual %.1f GB; close apps and restart for full speed, or force a size with --memory-gb",
@@ -1021,7 +1055,9 @@ public enum Planner {
                 format: "this machine could hold more, but decode stops improving around here (measured 11.2 tok/s at 120 experts/layer, 11.6 at 150) — auto caps at %.1f GB rather than spend RAM for nothing; --memory-gb N to go further",
                 usefulCeilingGB))
         }
-        let slots = slotsForTarget(target - (mtpOn ? mtpResidentGB : 0) - contextCharge, profile: profile)
+        let slots = slotsForTarget(
+            target - (mtpOn ? mtpResidentGB : 0) - contextCharge,
+            profile: profile, floorSlots: poolFloorSlots)
         return finish(.auto, slots, target: target, mtpOn: mtpOn)
     }
 }

@@ -14,6 +14,27 @@ enum DS4Constants {
     static let indexerQatScale: Float = 0.08838834764831845
 }
 
+/// Forward-pass trace (SLOTSTREAM_DS4_TRACE=1): per-layer activation and
+/// routing stats on stderr, for bisecting nonsense decodes against the real
+/// checkpoint. Off by default; every read syncs, so it is diagnostics only.
+enum DS4Trace {
+    static let on = ProcessInfo.processInfo.environment["SLOTSTREAM_DS4_TRACE"] == "1"
+
+    static func log(_ s: @autoclosure () -> String) {
+        guard on else { return }
+        FileHandle.standardError.write((s() + "\n").data(using: .utf8)!)
+    }
+
+    /// Scalar RMS of the whole tensor (syncs).
+    static func rms(_ x: MLXArray) -> Float {
+        sqrt(x.asType(.float32).square().mean().item(Float.self))
+    }
+
+    static func finite(_ x: MLXArray) -> Bool {
+        isNaN(x.asType(.float32)).sum().item(Int.self) == 0
+    }
+}
+
 public final class DS4Model {
     public let cfg: DS4Config
     public let weights: DS4Weights
@@ -76,6 +97,9 @@ public final class DS4Model {
             hc = try attentionSublayer(l, hc: hc, cache: state.caches[l], state: state,
                                        positions: positions, pos0: pos0)
             hc = try ffnSublayer(l, hc: hc, ids: ids)
+            if DS4Trace.on {
+                DS4Trace.log("L\(l) out pos0=\(pos0) t=\(t) hc rms=\(DS4Trace.rms(hc)) finite=\(DS4Trace.finite(hc))")
+            }
             let pt0 = Date()
             eval(hc)
             if Self.prof { Self.profStage["layer.eval", default: 0] += -pt0.timeIntervalSinceNow }
@@ -140,6 +164,13 @@ public final class DS4Model {
                                     iters: cfg.sinkhornIterations) }
         let xSub = DS4Math.hcWeightedSum(pre: split.pre, hc: hc)
         let attnNorm = DS4Math.rmsNorm(xSub, weight: w.attnNorm, eps: cfg.rmsNormEpsilon)
+        if DS4Trace.on {
+            let combRowSums = split.comb.sum(axis: -1) // [T, dst] — each ~1
+            DS4Trace.log("L\(l) attn hc.pre[\(split.pre.dim(0))] mean=\(split.pre.mean().item(Float.self)) "
+                + "post mean=\(split.post.mean().item(Float.self)) "
+                + "combRowSum mean=\(combRowSums.mean().item(Float.self)) min=\(combRowSums.min().item(Float.self)) max=\(combRowSums.max().item(Float.self)) "
+                + "xSub rms=\(DS4Trace.rms(xSub)) attnNorm rms=\(DS4Trace.rms(attnNorm)) finite=\(DS4Trace.finite(attnNorm))")
+        }
 
         let qr = w.attnQA(attnNorm) // [T, qLoraRank]
         let qrN = DS4Math.rmsNorm(qr, weight: w.attnQANorm, eps: cfg.rmsNormEpsilon)
@@ -240,9 +271,16 @@ public final class DS4Model {
                 compCount: cache.compCount, indexCount: cache.indexCount))
         }
         var heads = Self.profStep("attn.rows") { concatenated(outs, axis: 0) } // [T, H, D]
+        if DS4Trace.on {
+            DS4Trace.log("L\(l) attn out rows=\(heads.dim(0)) rawWin=\(cache.rawWindow(pos0 + t - 1).dim(0)) "
+                + "compRows=\(cache.compCount) indexRows=\(cache.indexCount) heads rms=\(DS4Trace.rms(heads)) finite=\(DS4Trace.finite(heads))")
+        }
         heads = Self.profStep("attn.ropeinv") { DS4Math.ropeTail(heads, positions: positions, p: ropeParams[l], inverse: true) }
         let low = Self.profStep("attn.outA") { groupedOutProj(heads, oA: w.attnOutputA) }
         let attnOut = Self.profStep("attn.outB") { w.attnOutputB(low) }
+        if DS4Trace.on {
+            DS4Trace.log("L\(l) attn attnOut rms=\(DS4Trace.rms(attnOut)) finite=\(DS4Trace.finite(attnOut))")
+        }
         return DS4Math.hcPost(blockOut: attnOut, hc: hc, post: split.post, comb: split.comb)
     }
 
@@ -282,6 +320,10 @@ public final class DS4Model {
         let denom = weights.sum(axis: 0)
         let num = (weights * k).sum(axis: 0)
         let pooled = which(denom .> 0, num / denom, MLXArray(Float(0)))
+        if DS4Trace.on {
+            DS4Trace.log("compress pool pos=\(pos) ratio=\(ratio) headDim=\(headDim) "
+                + "pooled rms=\(DS4Trace.rms(pooled)) finite=\(DS4Trace.finite(pooled)) denom min=\(denom.min().item(Float.self))")
+        }
 
         if ratio == 4 {
             state.rotateRatio4()
@@ -374,6 +416,24 @@ public final class DS4Model {
 
         let clamp = cfg.swigluClampExp[l] // the limit itself, per ds4.c:12170
         let (sel, wts) = Self.profStep("ffn.router\(t == 1 ? ".dec" : "")") { routerSelection(norm: norm, w: w, ids: ids) }
+        // Routing decisions for the cache simulator, the same flat stream
+        // Qwen's MoELayer records (RouterTrace.swift): per MoE call, header
+        // layer/tokens/topK int32 then tokens·topK int16 ids. Prefill passes
+        // record too; trace_convert.py drops multi-token calls by default,
+        // which is right here as well — DS4 prefill never touches the pool.
+        if RouterTrace.on {
+            RouterTrace.record(layer: l, tokens: t, topK: cfg.expertUsedCount,
+                               ids: sel.asArray(Int32.self))
+        }
+        if DS4Trace.on {
+            let k = cfg.expertUsedCount
+            let sel0 = Array(sel[0].asArray(Int32.self).prefix(k))
+            let wts0 = Array(wts[0].asArray(Float.self).prefix(k))
+            var extra = ""
+            if w.ffnGateTid2Eid != nil { extra = " (hash tid2eid)" }
+            DS4Trace.log("L\(l) router\(t == 1 ? " dec" : "")\(extra) sel0=\(sel0) wts0=\(wts0.map { String(format: "%.4f", $0) }) "
+                + "norm rms=\(DS4Trace.rms(norm)) finite=\(DS4Trace.finite(norm))")
+        }
         // Decode (T == 1) goes through the slot pool, mirroring Qwen's
         // MoELayer.cached: unpin the previous layer, map the routed experts
         // into slots, and gather over the pool. Larger passes stay off the

@@ -288,6 +288,9 @@ public final class Generator {
         // the sampler invent a first token from nothing. Callers reject this at
         // the API boundary; this is the backstop.
         guard !promptIds.isEmpty else { return ([], stats) }
+        // The prefill phase covers the cache take, any disk-tier walk and the
+        // chunked reads — everything before the first sampled token.
+        let tPrefill = Milestone.start("prefill (\(promptIds.count) prompt tokens)")
         // Vision prompts are cacheable, but not on ids alone: every image
         // expands to a run of the same placeholder id, so a second picture of
         // the same shape produces identical ids. The image segments carry a
@@ -535,6 +538,7 @@ public final class Generator {
         }
         model.pool.resetStats()
         model.ngram.resetStats()
+        Milestone.end("prefill (\(promptIds.count) tokens)", tPrefill)
 
         // The prompt boundary is a turn node: one node holding everything
         // since the deepest node the loader matched — for a cold conversation
@@ -555,6 +559,7 @@ public final class Generator {
         // a token is sampled before it is fed, so both break paths below leave
         // the last one unconsumed and it must not be claimed.
         var consumed = promptIds
+        let tDecode = Milestone.start("decode (max \(params.maxTokens) tokens)")
         t0 = Date()
         if let head = mtpHead, speculationEnabled, let mtpState = state.mtp {
             speculativeDecode(
@@ -598,6 +603,7 @@ public final class Generator {
         if useDiskTier {
             saveDiskNode(to: consumed.count, state: state, tokens: consumed)
         }
+        Milestone.end("decode (\(out.count) tokens)", tDecode)
         stats.finishReason = reason
         stats.decodeTokens = out.count
         stats.decodeSeconds = -t0.timeIntervalSinceNow
@@ -654,6 +660,7 @@ extension Generator {
         // An empty prompt would leave `logits` at its placeholder value; the
         // engine rejects it at the API boundary and this is the backstop.
         guard !promptIds.isEmpty else { return ([], stats) }
+        let tPrefill = Milestone.start("prefill (\(promptIds.count) prompt tokens)")
         stats.promptTokens = promptIds.count
         MLX.Memory.peakMemory = 0
         model.pool.resetStats()
@@ -677,6 +684,9 @@ extension Generator {
                 stats.prefillSeconds = -t0.timeIntervalSinceNow
                 stats.peakMemoryGB = ProcessMemory.peakResidentGB
                 stats.mlxPeakMemoryGB = Double(MLX.Memory.peakMemory) / 1e9
+                // Cancelled mid-prefill: the END still fires so the log never
+                // holds an unpaired START.
+                Milestone.end("prefill (\(promptIds.count) tokens)", tPrefill)
                 return ([], stats)
             }
             let hi = min(i + PrefillSchedule.chunk(at: i, maxChunk: prefillChunk), promptIds.count)
@@ -701,12 +711,14 @@ extension Generator {
         stats.prefillScatterSeconds = model.pool.scatterSeconds
         stats.prefillRecords = model.pool.recordsFetched
         model.pool.resetStats()
+        Milestone.end("prefill (\(promptIds.count) tokens)", tPrefill)
 
         // ---- decode. Sampling, stop and cancellation follow the Qwen loop
         // exactly; the sampler is model-agnostic (logits in, token out).
         var out: [Int] = []
         var generated = Set<Int>()
         var reason = "length"
+        let tDecode = Milestone.start("decode (max \(params.maxTokens) tokens)")
         t0 = Date()
         for _ in 0 ..< max(0, params.maxTokens) {
             if let keepGoing = shouldContinue, !keepGoing() { reason = "stop"; break }
@@ -723,6 +735,7 @@ extension Generator {
             }
             eval(logits)
         }
+        Milestone.end("decode (\(out.count) tokens)", tDecode)
         stats.finishReason = reason
         stats.decodeTokens = out.count
         stats.decodeSeconds = -t0.timeIntervalSinceNow

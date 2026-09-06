@@ -4,6 +4,7 @@
 
 import Foundation
 import MLX
+import Metal
 
 public struct ExpertKey: Hashable {
     public let layer: Int
@@ -354,6 +355,30 @@ public final class SlotPool {
         self.pinned = Array(repeating: false, count: slots)
         pools = allocatePools(slots)
         eval(pools)
+    }
+
+    /// `--preallocate` (CLI `run`): commit the pool's backing pages before the
+    /// first request. Init already allocates every slot up front and
+    /// zero-fills it through MLX, but macOS maps shared Metal storage as
+    /// demand-zero pages, so process RSS settles at the full pool only as
+    /// those writes land. A CPU memset through the real backing pointer —
+    /// the `noCopy` MTLBuffer wraps MLX's storage without copying it, and
+    /// Cmlx is not an importable product — faults every page in at boot, so
+    /// RSS is flat from the first token. No allocation, no transient, same
+    /// zeros: the pool's bytes are unchanged either way. Returns the bytes
+    /// committed.
+    @discardableResult
+    public func preallocate() -> Int {
+        // Any default device will do: the wrapper only aliases a pointer the
+        // model's device already allocated, and is never encoded into work.
+        guard let device = MTLCreateSystemDefaultDevice() else { return 0 }
+        var committed = 0
+        for p in pools.indices {
+            guard let buf = pools[p].asMTLBuffer(device: device, noCopy: true) else { continue }
+            memset(buf.contents(), 0, pools[p].nbytes)
+            committed += pools[p].nbytes
+        }
+        return committed
     }
 
     /// Resize the pool. Must only be called between requests (the caller holds

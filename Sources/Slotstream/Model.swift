@@ -65,13 +65,22 @@ public final class Qwen4ExpModel {
                 "expert-pool slot count must be between 1 and \(Geometry.totalRecords), got \(poolSlots)")
         }
         self.runLayers = selectedLayers
+        let tStore = Milestone.start("open expert store")
         let store = try ExpertStore(index: index)
+        Milestone.end("open expert store", tStore)
         // Reject a wrong/custom checkpoint before allocating the 3.8 GB
         // resident trunk or the expert pool.
         try Geometry.check(against: index.config, recordBytes: store.recordBytes)
-        // parity rigs keep the truncated layers' experts resident? no — pool serves them
+        // Neither loader prints a byte total up front, so the trunk milestone
+        // carries no size (a static figure would be a guess).
+        let tTrunk = Milestone.start("load resident trunk")
         self.resident = try ResidentWeights(index: index)
+        Milestone.end("load resident trunk", tTrunk)
+        // parity rigs keep the truncated layers' experts resident? no — pool serves them
+        let poolGB = String(format: "%.1f", Geometry.gb(poolSlots))
+        let tPool = Milestone.start("build slot pool (\(poolGB) GB)")
         self.pool = SlotPool(slots: poolSlots, source: .qwen(store))
+        Milestone.end("build slot pool (\(poolGB) GB)", tPool)
         self.ngram = NgramStore(index: index, resident: resident)
         self.rope = Rope(dim: cfg.rotaryDim, base: cfg.ropeTheta)
 

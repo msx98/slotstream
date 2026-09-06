@@ -8,9 +8,13 @@ Only single-token calls are kept by default, and that is the point rather than
 convenience: a prefill pass of 256 tokens or more takes the sweep, which never
 reads or writes the slot pool, so its routing is not cache traffic. Simulating
 it would report a hit rate for accesses the pool never sees. `--all` keeps
-everything for anyone measuring routing itself rather than the cache.
+everything for anyone measuring routing itself rather than the cache. (The DS4
+prefill also never touches the pool, so the same default is right there.)
 
-usage: trace_convert.py <trace.bin> <out.npz> [--all] [--name decode]
+usage: trace_convert.py <trace.bin> <out.npz> [--all] [--name decode] [--layers N]
+
+The layer count for the completeness check comes from the stream (a pass
+visits every layer in order, so max(layer)+1) unless pinned with --layers.
 """
 import sys
 import numpy as np
@@ -33,12 +37,16 @@ def read_stream(path):
 
 
 def main():
+    global N_LAYERS
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     keep_all = "--all" in sys.argv
     name = "decode"
+    n_layers = None
     for a in sys.argv[1:]:
         if a.startswith("--name"):
             name = a.split("=", 1)[1] if "=" in a else name
+        elif a.startswith("--layers"):
+            n_layers = int(a.split("=", 1)[1])
     src, dst = args[0], args[1]
 
     calls = read_stream(src)
@@ -47,6 +55,7 @@ def main():
         print("no calls matched; use --all to include multi-token passes")
         sys.exit(1)
     topk = kept[0][2]
+    N_LAYERS = n_layers if n_layers is not None else max(c[0] for c in calls) + 1
 
     # Group into steps: a step is one visit to every layer, in layer order.
     steps, cur = [], {}

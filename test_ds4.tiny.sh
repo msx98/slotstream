@@ -21,7 +21,7 @@ pkill -9 -f slotstream
 
 nohup .build/debug/slotstream run \
     --model /opt/common/models/text/antirez/deepseek-v4-gguf \
-    --memory-gb 30 \
+    --pool-floor-gb 0.3 --memory-gb 12 \
     --max-tokens 4 \
     --prompt "What is the capital of France? Respond with exactly one word:" \
     > "${OUTPUT_PATH}" 2>&1 & 1>/dev/null 2>/dev/null
