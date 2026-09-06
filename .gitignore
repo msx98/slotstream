@@ -8,6 +8,9 @@ models/
 __pycache__/
 bench/traces/*.npz
 
+.logs/
+nohup.out
+
 Tools/coldread
 Tools/diskbench
 bench/parity*/
