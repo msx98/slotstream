@@ -19,10 +19,10 @@ export SLOTSTREAM_DS4_PROF=1
 if [ -e ".logs/output.pid" ]; then kill -9 $(cat .logs/output.pid); rm .logs/output.pid; fi;
 pkill -9 -f slotstream
 
-nohup .build/debug/slotstream run \
+nohup .build/release/slotstream run \
     --model /opt/common/models/text/antirez/deepseek-v4-gguf \
     --memory-gb 30 \
-    --max-tokens 4 \
+    --max-tokens 32 \
     --prompt "What is the capital of France? Respond with exactly one word:" \
     > "${OUTPUT_PATH}" 2>&1 & 1>/dev/null 2>/dev/null
 
