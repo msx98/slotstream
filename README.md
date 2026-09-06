@@ -148,10 +148,11 @@ as the API key. These addresses work for clients running directly on the same
 Mac; a client in a container needs its own networking setup.
 
 Open WebUI, the Ollama CLI, and OpenAI SDKs have been tested. The server
-supports chat, streaming, images, and sampling options. Tool calling is
-available through the [fx gateway](#coding-agents); the Ollama and OpenAI
-endpoints currently reject tools, JSON-schema output, and logprobs with a
-400 error. See the [API reference](docs/API.md) for the supported fields.
+supports chat, streaming, images, tool calling, and sampling options. Tools
+work on the OpenAI-compatible endpoint and through the
+[fx gateway](#coding-agents); the Ollama endpoints still reject tools, and
+JSON-schema output and logprobs return 400 everywhere. See the
+[API reference](docs/API.md) for the supported fields.
 
 ### Pictures
 
@@ -342,7 +343,8 @@ aren't supported. See [Related projects](#related-projects) for other runtimes.
   [Hardware measurements](docs/HARDWARE.md).
 - **Concurrency:** one model process per user, with one generation at a time.
 - **Compatibility:** macOS 14/15 runtime testing is still needed. Tool calling
-  works through the fx gateway; the OpenAI and Ollama subsets don't support it.
+  works through the fx gateway and the OpenAI-compatible endpoint; the Ollama
+  subset doesn't support it.
 - **Vision:** the image encoder is checked against an independent reference
   and the APIs are tested with images. There is no general vision accuracy
   benchmark or comparison with another runtime yet.

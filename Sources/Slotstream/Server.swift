@@ -536,6 +536,33 @@ public final class Server {
                     out["content"] = hasImage ? parts : contentText(parts as Any?)
                 } else { out["content"] = "" }
             } else { out["content"] = "" }
+            // An assistant turn's calls, reshaped to what the template reads.
+            // The wire (OpenAI) carries `arguments` as a JSON string, but the
+            // template's `arguments|items` iterates an object; a string would
+            // render as nothing and the replayed call would look called with
+            // no arguments. messageError already validated every shape here.
+            if let calls = m["tool_calls"] as? [[String: Any]] {
+                out["tool_calls"] = calls.map { c in
+                    let f = c["function"] as? [String: Any] ?? [:]
+                    let args: Any
+                    switch f["arguments"] {
+                    case let o as [String: Any]: args = o
+                    case let s as String:
+                        args = (s.isEmpty
+                            ? [String: Any]()
+                            : (try? JSONSerialization.jsonObject(with: Data(s.utf8))) as? [String: Any])
+                            ?? [String: Any]()
+                    default: args = [String: Any]()
+                    }
+                    return [
+                        "type": "function",
+                        "function": [
+                            "name": f["name"] as? String ?? "",
+                            "arguments": args,
+                        ] as [String: Any],
+                    ]
+                }
+            }
             // Ollama's `images` array is per message and carries no order
             // relative to the text, so it is rendered the way Qwen's template
             // reads best and the way the typed path (`ChatMessage.images`)
@@ -635,8 +662,51 @@ public final class Server {
                 return "messages[\(i)] has unsupported field(s): "
                     + extra.sorted().joined(separator: ", ")
             }
-            if m["tool_calls"] != nil || m["tool_call_id"] != nil {
-                return "messages[\(i)] uses tools, which this server does not support"
+            // Replayed tool history. A turn may only START with tools where the
+            // dialect declares them (/v1 `tools`; /api/chat still refuses the
+            // field), but a client replaying an earlier conversation must be
+            // able to send the turns it produced, or its second request is a
+            // 400 for describing its own past.
+            if let calls = m["tool_calls"] {
+                guard m["role"] as? String == "assistant" else {
+                    return "messages[\(i)] has tool_calls but is not an assistant message"
+                }
+                guard let arr = calls as? [[String: Any]] else {
+                    return "messages[\(i)].tool_calls must be an array"
+                }
+                for (j, c) in arr.enumerated() {
+                    let cExtra = Set(c.keys).subtracting(["type", "id", "function"])
+                    if !cExtra.isEmpty {
+                        return "messages[\(i)].tool_calls[\(j)] has unsupported field(s): "
+                            + cExtra.sorted().joined(separator: ", ")
+                    }
+                    guard let f = c["function"] as? [String: Any] else {
+                        return "messages[\(i)].tool_calls[\(j)] needs a function object"
+                    }
+                    guard let n = f["name"] as? String, !n.isEmpty else {
+                        return "messages[\(i)].tool_calls[\(j)].function.name must be a non-empty string"
+                    }
+                    switch f["arguments"] {
+                    case nil, is [String: Any]:
+                        break
+                    case let s as String:
+                        // OpenAI's wire carries arguments as a JSON string;
+                        // "" is the wire spelling of "no arguments".
+                        if s.isEmpty { break }
+                        guard let o = try? JSONSerialization.jsonObject(with: Data(s.utf8)),
+                            o is [String: Any]
+                        else {
+                            return "messages[\(i)].tool_calls[\(j)].function.arguments "
+                                + "must be a JSON object (string or native)"
+                        }
+                    default:
+                        return "messages[\(i)].tool_calls[\(j)].function.arguments "
+                            + "must be an object or a JSON string"
+                    }
+                }
+            }
+            if m["tool_call_id"] != nil, m["tool_call_id"] as? String == nil {
+                return "messages[\(i)].tool_call_id must be text"
             }
             // Ollama's field. `[Any]` would accept `[1, 2, 3]` and then drop
             // it silently on the way to the template, answering as if no
@@ -647,8 +717,8 @@ public final class Server {
                 }
             }
             guard let role = m["role"] as? String,
-                ["system", "user", "assistant"].contains(role)
-            else { return "messages[\(i)].role must be system, user, or assistant" }
+                ["system", "user", "assistant", "tool"].contains(role)
+            else { return "messages[\(i)].role must be system, user, assistant, or tool" }
             if let parts = m["content"] as? [[String: Any]] {
                 for (j, part) in parts.enumerated() {
                     let extra = Set(part.keys).subtracting(["type", "text", "image_url", "image"])
@@ -680,7 +750,10 @@ public final class Server {
                         return "messages[\(i)] contains unsupported content type '\(kind)'"
                     }
                 }
-            } else if m["content"] as? String == nil {
+            } else if !(m["content"] is NSNull), m["content"] as? String == nil {
+                // JSON null means "not set": OpenAI clients send
+                // `"content": null` on an assistant turn that only called
+                // tools, and the template renders it as empty.
                 return "messages[\(i)].content must be text or a content array"
             }
         }
@@ -770,21 +843,123 @@ public final class Server {
                 return "only response_format {\"type\": \"text\"} is supported"
             }
         }
-        if let v = json["tools"] {
-            guard let list = v as? [Any], list.isEmpty else {
-                return "tool calling is not supported"
-            }
-        }
-        if json["tool_choice"] != nil, (json["tool_choice"] as? String) != "none" {
-            return "tool calling is not supported"
-        }
-        if json["parallel_tool_calls"] != nil, bool(json["parallel_tool_calls"]) != false {
-            return "tool calling is not supported"
+        // tools and tool_choice are real features here now (see openAITools),
+        // not no-ops. parallel_tool_calls stays one: the model may emit
+        // several calls in one reply and nothing can enforce the opposite, so
+        // `true` (the OpenAI default, describing what already happens) is the
+        // accepted value and `false` — a constraint this server cannot honour —
+        // is refused rather than silently dropped.
+        if json["parallel_tool_calls"] != nil, bool(json["parallel_tool_calls"]) != true {
+            return "parallel_tool_calls: false cannot be enforced; the model may emit several tool calls in one reply"
         }
         if json["user"] != nil, json["user"] as? String == nil {
             return "user must be text"
         }
         return nil
+    }
+
+    /// Parsed tools for one /v1 request: the wire objects the template
+    /// renders, the reduced schemas the parser coerces with, and the choice.
+    struct V1Tools {
+        var render: [[String: Any]]
+        var schemas: [ToolSchema]
+        var choice: GatewayDialect.ToolChoice
+    }
+
+    /// A refused request, carrying the sentence the 400 shows.
+    struct V1ToolError: Error {
+        let message: String
+    }
+
+    /// OpenAI tool calling, validated. The wire shape is
+    /// `{"type":"function","function":{"name","description","parameters"}}`,
+    /// which is also exactly what the chat template renders, so a validated
+    /// tool is rebuilt into that shape (dropping everything else, the way the
+    /// gateway dialect rebuilds `ToolDefinition` from `name`, `description`
+    /// and `inputSchema`) and passed through verbatim.
+    static func openAITools(_ json: [String: Any]) -> Result<V1Tools, V1ToolError> {
+        var render: [[String: Any]] = []
+        var schemas: [ToolSchema] = []
+        if let raw = json["tools"] as? [Any] {
+            for (i, t) in raw.enumerated() {
+                guard let o = t as? [String: Any] else {
+                    return .failure(V1ToolError(message: "tools[\(i)] must be an object"))
+                }
+                // Provider-executed tools (code_interpreter, web_search, …)
+                // are dropped before rendering: the model cannot run them,
+                // and showing it a tool nothing will execute invites a call
+                // that can only fail. Same rule as the gateway dialect.
+                let kind = o["type"] as? String ?? "function"
+                guard kind == "function" else { continue }
+                guard let f = o["function"] as? [String: Any] else {
+                    return .failure(
+                        V1ToolError(message: "tools[\(i)] is a function tool without a function object"))
+                }
+                guard let name = f["name"] as? String, !name.isEmpty else {
+                    return .failure(
+                        V1ToolError(message: "tools[\(i)].function.name must be a non-empty string"))
+                }
+                if f["description"] != nil, f["description"] as? String == nil {
+                    return .failure(V1ToolError(message: "tools[\(i)].function.description must be text"))
+                }
+                let parameters: JSONValue
+                switch f["parameters"] {
+                case nil: parameters = .object([:])
+                case let p as [String: Any]: parameters = JSONValue.from(p)
+                default:
+                    return .failure(
+                        V1ToolError(message: "tools[\(i)].function.parameters must be a JSON schema object"))
+                }
+                render.append([
+                    "type": "function",
+                    "function": [
+                        "name": name,
+                        "description": f["description"] as? String ?? "",
+                        "parameters": parameters.any,
+                    ] as [String: Any],
+                ])
+                schemas.append(ToolDefinition(name: name, description: "", parameters: parameters).schema)
+            }
+        } else if json["tools"] != nil {
+            return .failure(V1ToolError(message: "tools must be an array"))
+        }
+        var choice = GatewayDialect.ToolChoice.auto
+        if let tc = json["tool_choice"] {
+            if let s = tc as? String {
+                switch s {
+                case "auto": choice = .auto
+                case "none": choice = .disabled
+                case "required": choice = .required
+                default:
+                    return .failure(V1ToolError(message:
+                        "tool_choice must be \"auto\", \"none\", \"required\", "
+                            + "or {\"type\":\"function\",\"function\":{\"name\":\"...\"}}"))
+                }
+            } else if let o = tc as? [String: Any] {
+                guard (o["type"] as? String) == "function" else {
+                    return .failure(V1ToolError(message:
+                        "tool_choice objects must be {\"type\":\"function\",\"function\":{\"name\":\"...\"}}"))
+                }
+                guard let n = (o["function"] as? [String: Any])?["name"] as? String, !n.isEmpty else {
+                    return .failure(V1ToolError(message: "tool_choice.function.name must be a non-empty string"))
+                }
+                choice = .tool(n)
+            } else {
+                return .failure(V1ToolError(message: "tool_choice must be a string or an object"))
+            }
+        }
+        switch choice {
+        case .auto, .disabled:
+            break
+        case .required, .tool:
+            guard !schemas.isEmpty else {
+                return .failure(V1ToolError(message: "tool_choice \(choice.label) needs at least one tool"))
+            }
+            if case .tool(let n) = choice, !schemas.contains(where: { $0.name == n }) {
+                return .failure(V1ToolError(message: "tool_choice names '\(n)', which is not in tools"))
+            }
+        }
+        return .success(V1Tools(render: render, schemas: schemas, choice: choice))
     }
 
     private func openAIValidationError(_ json: [String: Any]) -> String? {
@@ -1395,6 +1570,20 @@ public final class Server {
         return out
     }
 
+    /// The same instruction over the raw message dicts the OpenAI path renders.
+    /// Must stay textually identical to `instructing`: both produce the line
+    /// the model is forced by, and a tool turn through either dialect should
+    /// read the same instruction the same way.
+    static func instructingRaw(_ messages: [[String: Any]], _ line: String) -> [[String: Any]] {
+        var out = messages
+        if let i = out.firstIndex(where: { ($0["role"] as? String) == "system" }) {
+            out[i]["content"] = ((out[i]["content"] as? String) ?? "") + "\n\n" + line
+        } else {
+            out.insert(["role": "system", "content": line], at: 0)
+        }
+        return out
+    }
+
     // MARK: /v1/chat/completions (OpenAI, SSE streaming)
 
     private func v1Chat(_ fd: Int32, _ rawJSON: [String: Any], cors: String) {
@@ -1407,7 +1596,24 @@ public final class Server {
         }
         let msgs = Self.messages(json)
         let stream = Self.bool(json["stream"]) ?? false
-        var params = SampleParams.instruct
+        let tools: V1Tools
+        switch Self.openAITools(json) {
+        case .success(let t): tools = t
+        case .failure(let e):
+            respondJSON(
+                fd, ["error": ["message": e.message, "type": "invalid_request_error"]],
+                status: "400 Bad Request", cors: cors)
+            return
+        }
+        // `none` renders no <tools> block; the history still renders, so a
+        // tool conversation replayed under tool_choice "none" still reads.
+        // With the tools live, sampling starts from the gateway's agent
+        // defaults — the instruct presence penalty of 1.5 taxes the tool
+        // grammar's closing tags exactly where the model must stay on it
+        // (see SampleParams.agent). Explicit knobs below still win.
+        let renderTools = tools.choice == .disabled ? [] : tools.render
+        let renderSchemas = tools.choice == .disabled ? [] : tools.schemas
+        var params: SampleParams = renderTools.isEmpty ? .instruct : .agent
         if let v = Self.num(json["temperature"]) { params.temperature = Float(v) }
         if let v = Self.num(json["top_p"]) { params.topP = Float(v) }
         if let v = Self.int(json["top_k"]) { params.topK = v }
@@ -1431,12 +1637,18 @@ public final class Server {
         // Vision content arrives as typed parts in `content` (image_url); the
         // template renders them to image_pad tokens, and encodeWithVision
         // expands those to the tower's per-image tokens.
-        let templateMsgs = Self.templateMessages(json)
+        var templateMsgs = Self.templateMessages(json)
+        if case .tool(let name) = tools.choice {
+            templateMsgs = Self.instructingRaw(templateMsgs, "You must call the \(name) tool now.")
+        } else if tools.choice == .required {
+            templateMsgs = Self.instructingRaw(templateMsgs, "You must call one of the available tools now.")
+        }
         let ids: [Int]
         let vision: VisionPrompt?
         do {
             (ids, vision) = try engine.encodeWithVision(
-                messages: templateMsgs, tools: nil, thinking: false)
+                messages: templateMsgs, tools: renderTools.isEmpty ? nil : renderTools,
+                thinking: false)
         } catch {
             respondJSON(
                 fd, ["error": ["message": "\(error)"]], status: "400 Bad Request", cors: cors)
@@ -1451,31 +1663,96 @@ public final class Server {
         if stream, !startChunked(fd, contentType: "text/event-stream", cors: cors) { return }
         var alive = true
         var sentRole = false
-        let callback: ((Int, String) -> Bool)? = stream ? { _, delta in
-            guard alive, !delta.isEmpty else { return alive }
+        var sawCall = false
+        var toolIndex = 0
+        // The parser runs only when tools are live: with none declared the
+        // path is byte-identical to a plain completion, right down to emitting
+        // each token's delta the moment it arrives, with no hold-back.
+        let splitter = renderSchemas.isEmpty ? nil : ToolCallSplitter(tools: renderSchemas)
+        func emitDelta(_ d: [String: Any]) {
+            guard alive, !d.isEmpty else { return }
+            var dd = d
             // OpenAI's first delta carries the role; clients look for it.
-            var d: [String: Any] = ["content": delta]
             if !sentRole {
-                d["role"] = "assistant"
+                dd["role"] = "assistant"
                 sentRole = true
             }
             let obj: [String: Any] = [
                 "id": rid, "object": "chat.completion.chunk",
                 "created": Int(Date().timeIntervalSince1970), "model": self.engine.modelName,
-                "choices": [["index": 0, "delta": d, "finish_reason": NSNull()]],
+                "choices": [["index": 0, "delta": dd, "finish_reason": NSNull()]],
             ]
             let data = try! JSONSerialization.data(withJSONObject: obj)
             alive = self.chunk(fd, Data("data: ".utf8) + data + Data("\n\n".utf8))
+        }
+        /// Stream one parser event batch as OpenAI tool-call fragments. The
+        /// splitter's input deltas are already the incremental `arguments`
+        /// JSON the wire wants — concatenated, they are the complete object —
+        /// and `index` numbers the calls within the reply.
+        func handle(_ events: [ToolStreamEvent]) {
+            for e in events {
+                switch e {
+                case .text(let t):
+                    emitDelta(["content": t])
+                case .toolInputStart(let id, let name):
+                    emitDelta(["tool_calls": [[
+                        "index": toolIndex, "id": id, "type": "function",
+                        "function": ["name": name, "arguments": ""],
+                    ] as [String: Any]]])
+                case .toolInputDelta(_, let frag):
+                    emitDelta(["tool_calls": [[
+                        "index": toolIndex, "function": ["arguments": frag],
+                    ] as [String: Any]]])
+                case .toolInputEnd:
+                    toolIndex += 1
+                case .toolCall:
+                    sawCall = true
+                case .malformed(let t):
+                    // Never lost: an unterminated block is the model's output
+                    // and the user should see what it actually produced.
+                    emitDelta(["content": t])
+                }
+            }
+        }
+        let callback: ((Int, String) -> Bool)? = stream ? { _, delta in
+            guard alive, !delta.isEmpty else { return alive }
+            if let splitter {
+                handle(splitter.push(delta))
+            } else {
+                emitDelta(["content": delta])
+            }
             return alive
         } : nil
         let (text, _, stats) = engine.generate(
             promptIds: ids, params: params, vision: vision,
             shouldContinue: { self.peerAlive(fd) }, onToken: callback)
+        handle(splitter?.flush() ?? [])
+        // Non-streamed replies split the whole text in one push; streamed ones
+        // have already emitted their events above.
+        var parsed = (content: text, calls: [[String: Any]]())
+        if let splitter, !stream {
+            var content = ""
+            for e in ToolCallSplitter.parseAll(text, tools: renderSchemas) {
+                switch e {
+                case .text(let t): content += t
+                case .toolCall(let c):
+                    sawCall = true
+                    parsed.calls.append([
+                        "id": c.id, "type": "function",
+                        "function": ["name": c.name, "arguments": c.inputJSON],
+                    ])
+                case .malformed(let t): content += t
+                default: break
+                }
+            }
+            parsed.content = content
+        }
+        let finishReason = sawCall ? "tool_calls" : stats.finishReason
         if stream, alive {
             var fin: [String: Any] = [
                 "id": rid, "object": "chat.completion.chunk",
                 "created": Int(Date().timeIntervalSince1970), "model": engine.modelName,
-                "choices": [["index": 0, "delta": [:], "finish_reason": stats.finishReason]],
+                "choices": [["index": 0, "delta": [:], "finish_reason": finishReason]],
             ]
             if wantUsage {
                 fin["usage"] = [
@@ -1488,6 +1765,19 @@ public final class Server {
             chunk(fd, Data("data: [DONE]\n\n".utf8))
             endChunked(fd)
         } else {
+            var message: [String: Any] = ["role": "assistant", "content": text]
+            if splitter != nil {
+                // OpenAI's own shape: a turn that only calls tools has
+                // `"content": null`, not an empty string.
+                if parsed.calls.isEmpty {
+                    message["content"] = parsed.content
+                } else if parsed.content.isEmpty {
+                    message["content"] = NSNull()
+                } else {
+                    message["content"] = parsed.content
+                }
+                if !parsed.calls.isEmpty { message["tool_calls"] = parsed.calls }
+            }
             respondJSON(
                 fd,
                 [
@@ -1495,8 +1785,8 @@ public final class Server {
                     "created": Int(Date().timeIntervalSince1970), "model": engine.modelName,
                     "choices": [
                         [
-                            "index": 0, "finish_reason": stats.finishReason,
-                            "message": ["role": "assistant", "content": text],
+                            "index": 0, "finish_reason": finishReason,
+                            "message": message,
                         ]
                     ],
                     "usage": [

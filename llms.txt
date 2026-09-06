@@ -36,8 +36,8 @@ The README, user guides, and changelog are combined in
 ## API
 
 - Ollama dialect: `POST /api/chat` and `POST /api/generate` (stream by default), `GET /api/tags`, `GET /api/ps`, `POST /api/show`, `GET /api/version`. OpenAI dialect: `POST /v1/chat/completions` (`stream: false` by default) and `GET /v1/models`; base URL `http://localhost:11434/v1`, any `api_key`.
-- The AI SDK gateway supports tool calling and images: `POST /v3/ai/language-model` (also `/v1/ai/language-model`), `GET /coding-agent/v1/models`, and `GET /coding-agent/v1/credits`. See [fx setup](https://raw.githubusercontent.com/carloslfu/slotstream/main/docs/FX.md).
-- Sampling defaults for the Ollama/OpenAI endpoints: `temperature` 0.7, `top_p` 0.8, `top_k` 20, `min_p` 0, `presence_penalty` 1.5, `num_predict`/`max_tokens` 512, `seed` random, `stop` none. Unknown fields return a 400 that names them; tools on these endpoints, JSON-schema output, logprobs, and embeddings return 400; a wrong model is a 400 (404 on `/api/show`); `/api/pull` and `/api/create` are 501. Prompt plus completion is capped at 32,768 tokens.
+- The AI SDK gateway supports tool calling and images: `POST /v3/ai/language-model` (also `/v1/ai/language-model`), `GET /coding-agent/v1/models`, and `GET /coding-agent/v1/credits`. See [fx setup](https://raw.githubusercontent.com/carloslfu/slotstream/main/docs/FX.md). The OpenAI dialect supports tool calling too: `tools` + `tool_choice` on `/v1/chat/completions`, replies carry `message.tool_calls` with `finish_reason: "tool_calls"`, results replay as `role: "tool"`.
+- Sampling defaults for the Ollama/OpenAI endpoints: `temperature` 0.7, `top_p` 0.8, `top_k` 20, `min_p` 0, `presence_penalty` 1.5, `num_predict`/`max_tokens` 512, `seed` random, `stop` none (tool turns on `/v1` use 0.2 / 0.9 / 0 until the client sets them). Unknown fields return a 400 that names them; tools on the Ollama endpoints, JSON-schema output, logprobs, and embeddings return 400; a wrong model is a 400 (404 on `/api/show`); `/api/pull` and `/api/create` are 501. Prompt plus completion is capped at 32,768 tokens.
 
 ## Docs
 

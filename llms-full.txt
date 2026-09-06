@@ -156,10 +156,11 @@ as the API key. These addresses work for clients running directly on the same
 Mac; a client in a container needs its own networking setup.
 
 Open WebUI, the Ollama CLI, and OpenAI SDKs have been tested. The server
-supports chat, streaming, images, and sampling options. Tool calling is
-available through the [fx gateway](#coding-agents); the Ollama and OpenAI
-endpoints currently reject tools, JSON-schema output, and logprobs with a
-400 error. See the [API reference](docs/API.md) for the supported fields.
+supports chat, streaming, images, tool calling, and sampling options. Tools
+work on the OpenAI-compatible endpoint and through the
+[fx gateway](#coding-agents); the Ollama endpoints still reject tools, and
+JSON-schema output and logprobs return 400 everywhere. See the
+[API reference](docs/API.md) for the supported fields.
 
 ### Pictures
 
@@ -350,7 +351,8 @@ aren't supported. See [Related projects](#related-projects) for other runtimes.
   [Hardware measurements](docs/HARDWARE.md).
 - **Concurrency:** one model process per user, with one generation at a time.
 - **Compatibility:** macOS 14/15 runtime testing is still needed. Tool calling
-  works through the fx gateway; the OpenAI and Ollama subsets don't support it.
+  works through the fx gateway and the OpenAI-compatible endpoint; the Ollama
+  subset doesn't support it.
 - **Vision:** the image encoder is checked against an independent reference
   and the APIs are tested with images. There is no general vision accuracy
   benchmark or comparison with another runtime yet.
@@ -776,14 +778,31 @@ print(reply.choices[0].message.content)
 
 Accepted fields: `model`, `messages`, `stream`, `temperature`, `top_p`,
 `top_k`, `presence_penalty`, `max_tokens` / `max_completion_tokens`, `seed`,
-`stop`, and `stream_options` (`{"include_usage": true}`). `top_k` is a
-slotstream extension. JSON `null` is treated as unset.
+`stop`, `tools`, `tool_choice`, and `stream_options`
+(`{"include_usage": true}`). `top_k` is a slotstream extension. JSON `null`
+is treated as unset.
+
+Tool calling follows the OpenAI wire format. Declare function tools in
+`tools`; `tool_choice` takes `"auto"`, `"none"`, `"required"`, or
+`{"type":"function","function":{"name":"..."}}`. A turn that calls tools
+returns them in `message.tool_calls` with `finish_reason: "tool_calls"` —
+streamed as incremental `arguments` fragments that concatenate to the
+complete JSON object — and results come back as `role: "tool"` messages,
+with the assistant turn replayed including its `tool_calls` (`arguments` as
+a JSON string or an object, `"content": null`). Tools with a type other than
+`function` are dropped before rendering: the model cannot run them. `none`
+renders no tools at all. `required` and a named tool append a one-line
+instruction to the system turn — the model is steered toward a call, not
+constrained into one. When tools are live, requests that leave
+`temperature`, `top_p`, or `presence_penalty` unset use the tool-turn
+defaults (0.2, 0.9, 0) instead of the table below.
 
 For SDK compatibility, these fields are accepted only at the listed values:
 `n: 1`, `frequency_penalty: 0`, `logprobs: false`, `logit_bias: {}`,
-`tools: []`, `tool_choice: "none"`, `parallel_tool_calls: false`, and
-`response_format: {"type": "text"}`. `user` accepts any string and has no
-effect. Other values for these options return 400.
+`parallel_tool_calls: true`, and `response_format: {"type": "text"}`. `user`
+accepts any string and has no effect. Other values for these options return
+400 — including `parallel_tool_calls: false`, which nothing here can enforce:
+the model may emit several calls in one reply.
 
 ## Sampling defaults
 
@@ -1556,6 +1575,22 @@ that much, say so rather than picking the better one.
 
 What each release changed, newest first. `curl | sh` installs the latest
 release; anything under **Unreleased** is on `main` only.
+
+## Unreleased
+
+- **Tool calling on `/v1/chat/completions`.** The OpenAI-compatible endpoint
+  accepts `tools` and `tool_choice` instead of refusing them: declare
+  function tools, receive `message.tool_calls` with
+  `finish_reason: "tool_calls"` (streamed as incremental `arguments`
+  fragments that reassemble into the call), and feed results back as
+  `role: "tool"` turns with the assistant's call replayed in OpenAI's wire
+  shape. This is the same `<tool_call>` grammar and typed-argument coercion
+  the fx gateway serves, and whenever tools are live a request that leaves
+  `temperature`/`top_p`/`presence_penalty` unset uses the agent sampling
+  defaults (0.2 / 0.9 / 0) instead of the instruct ones. `tool_choice`
+  `required` and named tools steer the model with a system line rather than
+  constrain it; `parallel_tool_calls: true` is the accepted default and
+  `false` is refused, because nothing here can enforce it.
 
 ## 0.2.7 — 2026-09-04
 

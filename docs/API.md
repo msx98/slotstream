@@ -94,14 +94,31 @@ print(reply.choices[0].message.content)
 
 Accepted fields: `model`, `messages`, `stream`, `temperature`, `top_p`,
 `top_k`, `presence_penalty`, `max_tokens` / `max_completion_tokens`, `seed`,
-`stop`, and `stream_options` (`{"include_usage": true}`). `top_k` is a
-slotstream extension. JSON `null` is treated as unset.
+`stop`, `tools`, `tool_choice`, and `stream_options`
+(`{"include_usage": true}`). `top_k` is a slotstream extension. JSON `null`
+is treated as unset.
+
+Tool calling follows the OpenAI wire format. Declare function tools in
+`tools`; `tool_choice` takes `"auto"`, `"none"`, `"required"`, or
+`{"type":"function","function":{"name":"..."}}`. A turn that calls tools
+returns them in `message.tool_calls` with `finish_reason: "tool_calls"` —
+streamed as incremental `arguments` fragments that concatenate to the
+complete JSON object — and results come back as `role: "tool"` messages,
+with the assistant turn replayed including its `tool_calls` (`arguments` as
+a JSON string or an object, `"content": null`). Tools with a type other than
+`function` are dropped before rendering: the model cannot run them. `none`
+renders no tools at all. `required` and a named tool append a one-line
+instruction to the system turn — the model is steered toward a call, not
+constrained into one. When tools are live, requests that leave
+`temperature`, `top_p`, or `presence_penalty` unset use the tool-turn
+defaults (0.2, 0.9, 0) instead of the table below.
 
 For SDK compatibility, these fields are accepted only at the listed values:
 `n: 1`, `frequency_penalty: 0`, `logprobs: false`, `logit_bias: {}`,
-`tools: []`, `tool_choice: "none"`, `parallel_tool_calls: false`, and
-`response_format: {"type": "text"}`. `user` accepts any string and has no
-effect. Other values for these options return 400.
+`parallel_tool_calls: true`, and `response_format: {"type": "text"}`. `user`
+accepts any string and has no effect. Other values for these options return
+400 — including `parallel_tool_calls: false`, which nothing here can enforce:
+the model may emit several calls in one reply.
 
 ## Sampling defaults
 
