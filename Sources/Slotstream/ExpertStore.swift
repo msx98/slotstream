@@ -226,16 +226,87 @@ public final class ExpertStore {
 
 // MARK: - Slot pool
 
+/// The streaming source a SlotPool fills from. Both stores already speak the
+/// same contracts (readBatch rows in key order, readRuns ascending; row j of
+/// the returned piece holds keys[j] / experts[j]) — this box just carries the
+/// per-model piece layout and layer count as data, so the pool's
+/// ensure/admit/resize machinery stays store-agnostic. The Qwen case is the
+/// pre-existing behavior, byte for byte.
+public enum PoolSource {
+    case qwen(ExpertStore)
+    case ds4(DS4ExpertStore)
+
+    public var layerCount: Int {
+        switch self {
+        case .qwen(let s): return s.index.config.numLayers
+        case .ds4(let s): return s.layerCount
+        }
+    }
+
+    public var recordBytes: Int {
+        switch self {
+        case .qwen(let s): return s.recordBytes
+        case .ds4(let s): return s.recordBytes
+        }
+    }
+
+    /// One [slots, dim1, dim2] array per piece: the pool's layout, piece
+    /// order == readBatch piece order.
+    public func pieceSpecs(slots n: Int) -> [(shape: [Int], dtype: DType)] {
+        switch self {
+        case .qwen(let s):
+            return SlotPool.qwenPieceShapes(n, s.index.config)
+        case .ds4(let s):
+            return zip(s.poolShapes, s.poolDtypes).map { spec in
+                ([n, spec.0.rows, spec.0.cols], spec.1)
+            }
+        }
+    }
+
+    /// Non-throwing by contract at the pool: Qwen's store aborts on read
+    /// failure, and DS4's thrown errors (short pread, staging OOM) are the
+    /// same unrecoverable conditions, so the pool surfaces them the same way.
+    /// The DS4 model's *direct* read path (prefill) still throws properly.
+    public func readBatch(_ keys: [ExpertKey]) -> [MLXArray] {
+        switch self {
+        case .qwen(let s): return s.readBatch(keys)
+        case .ds4(let s):
+            do { return try s.readBatch(keys) }
+            catch { fatalError("DS4 expert pool read failed: \(error)") }
+        }
+    }
+
+    /// Contiguous-run staging reads (the Qwen prefill sweep). The DS4 sweep
+    /// is not built yet, so this is only reachable for Qwen; the DS4 branch
+    /// exists so a future sweep can call it unchanged, with the same
+    /// fatal-on-error contract as readBatch.
+    public func readRuns(layer: Int, experts: [Int]) -> [MLXArray] {
+        switch self {
+        case .qwen(let s): return s.readRuns(layer: layer, experts: experts)
+        case .ds4(let s):
+            do { return try s.readRuns(layer: layer, experts: experts) }
+            catch { fatalError("DS4 expert run read failed: \(error)") }
+        }
+    }
+}
+
 /// A fixed pool of expert slots shared across all layers (uniform shape), with
 /// CLOCK eviction. `ensure` maps (layer, expert) keys to slot indices, loading
 /// misses in one batched read + scatter. Bit-exact: the pool holds the same
 /// quantized bytes the checkpoint does.
+///
+/// Generalized from "exactly 9 Qwen pieces" to "piece count and shapes as
+/// data from the PoolSource": every loop over pieces now runs over the actual
+/// pool arrays, and the Qwen source still yields the same nine arrays in the
+/// same order with the same dtypes, so its bytes are unchanged.
 public final class SlotPool {
     public private(set) var slots: Int
-    private let cfg: ModelConfig
-    private let store: ExpertStore
+    private let source: PoolSource
+    private let layerCount: Int
+    private let pieceDims: [(Int, Int)]
+    private let pieceDtypes: [DType]
 
-    // pools, same order as ExpertStore.pieces
+    // pools, same order as the source's readBatch pieces
     public private(set) var pools: [MLXArray] = []
 
     private var map: [ExpertKey: Int] = [:]
@@ -248,13 +319,13 @@ public final class SlotPool {
 
     public var poolBytes: Int { pools.reduce(0) { $0 + $1.nbytes } }
     /// Bytes per expert record, measured from the checkpoint headers.
-    public var recordBytes: Int { store.recordBytes }
+    public var recordBytes: Int { source.recordBytes }
     /// The cache size in the per-layer unit of intuition (the pool itself is
     /// global and shared -- hot layers borrow from cold ones).
-    public var slotsPerLayer: Double { Double(slots) / Double(cfg.numLayers) }
+    public var slotsPerLayer: Double { Double(slots) / Double(layerCount) }
 
-    /// Per-piece shapes for a pool of `n` slots (order = ExpertStore.pieces).
-    private static func poolShapes(_ n: Int, _ cfg: ModelConfig) -> [(shape: [Int], dtype: DType)] {
+    /// Per-piece shapes for a Qwen pool of `n` slots (order = ExpertStore.pieces).
+    static func qwenPieceShapes(_ n: Int, _ cfg: ModelConfig) -> [(shape: [Int], dtype: DType)] {
         let h = cfg.hiddenSize
         let ff = cfg.moeIntermediate
         let g = cfg.qGroup
@@ -265,14 +336,23 @@ public final class SlotPool {
         ]
     }
 
-    public init(slots: Int, store: ExpertStore) {
+    private func allocatePools(_ n: Int) -> [MLXArray] {
+        pieceDims.indices.map { p in
+            MLXArray.zeros([n, pieceDims[p].0, pieceDims[p].1], dtype: pieceDtypes[p])
+        }
+    }
+
+    public init(slots: Int, source: PoolSource) {
         self.slots = slots
-        self.store = store
-        self.cfg = store.index.config
+        self.source = source
+        self.layerCount = source.layerCount
+        let specs = source.pieceSpecs(slots: slots)
+        self.pieceDims = specs.map { ($0.shape[1], $0.shape[2]) }
+        self.pieceDtypes = specs.map { $0.dtype }
         self.keyOf = Array(repeating: nil, count: slots)
         self.refBit = Array(repeating: false, count: slots)
         self.pinned = Array(repeating: false, count: slots)
-        pools = Self.poolShapes(slots, cfg).map { MLXArray.zeros($0.shape, dtype: $0.dtype) }
+        pools = allocatePools(slots)
         eval(pools)
     }
 
@@ -305,8 +385,9 @@ public final class SlotPool {
                 newRef[i] = refBit[s]
                 map[keyOf[s]!] = i
             }
-            for (p, spec) in Self.poolShapes(n, cfg).enumerated() {
-                let np = MLXArray.zeros(spec.shape, dtype: spec.dtype)
+            for p in pools.indices {
+                let np = MLXArray.zeros(
+                    [n, pieceDims[p].0, pieceDims[p].1], dtype: pieceDtypes[p])
                 if !occupied.isEmpty { np[0 ..< occupied.count] = pools[p][idx] }
                 eval(np)
                 pools[p] = np  // old piece freed here, bounding the transient
@@ -323,7 +404,7 @@ public final class SlotPool {
             refBit = Array(repeating: false, count: n)
             pinned = Array(repeating: false, count: n)
             hand = 0
-            pools = Self.poolShapes(n, cfg).map { MLXArray.zeros($0.shape, dtype: $0.dtype) }
+            pools = allocatePools(n)
             eval(pools)
         }
         slots = n
@@ -386,11 +467,11 @@ public final class SlotPool {
             while lo < missKeys.count {
                 let hi = min(lo + ExpertStore.defaultLoadBatch, missKeys.count)
                 let tIO = Date()
-                let batch = store.readBatch(Array(missKeys[lo ..< hi]))
+                let batch = source.readBatch(Array(missKeys[lo ..< hi]))
                 ioSeconds += -tIO.timeIntervalSinceNow
                 let tScatter = Date()
                 let idx = MLXArray(Array(slotIdx[lo ..< hi]))
-                for p in 0 ..< 9 {
+                for p in pools.indices {
                     pools[p][idx] = batch[p]
                 }
                 // Decode issues one of these per layer per token, and the
@@ -461,7 +542,7 @@ public final class SlotPool {
     /// staging (`ExpertStore.readRuns`); the pool is not written.
     public func readStaged(layer: Int, experts: [Int]) -> [MLXArray] {
         let t = Date()
-        let out = store.readRuns(layer: layer, experts: experts)
+        let out = source.readRuns(layer: layer, experts: experts)
         ioSeconds += -t.timeIntervalSinceNow
         misses += experts.count
         recordsFetched += experts.count
@@ -494,7 +575,7 @@ public final class SlotPool {
         let picked = staged.map { $0[from] }
         asyncEval(picked)
         let dst = MLXArray(victims)
-        for p in 0 ..< 9 { pools[p][dst] = picked[p] }
+        for p in pools.indices { pools[p][dst] = picked[p] }
         pendingAdmissions += victims.count
     }
     private var pendingAdmissions = 0

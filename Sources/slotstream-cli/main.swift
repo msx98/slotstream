@@ -17,7 +17,7 @@ struct Slotstream: ParsableCommand {
             PrefixCheck.self, ElasticDrill.self, RuntimeCheck.self, PullCheck.self,
             MTPParity.self, MTPAccept.self, MTPCheck.self, MTPFixtureInputs.self, MTPBench.self, MTPPassCost.self,
             ContextCheck.self, PrefillScheduleCommand.self, SweepCheck.self,
-            VisionParity.self,
+            VisionParity.self, DS4Check.self,
         ]
     )
 }
@@ -166,6 +166,26 @@ struct ModelOptions: ParsableArguments {
     // all see the real directory; Foundation will not list a symlinked one.
     var modelURL: URL { ModelLocator.resolve(model).resolvingSymlinksInPath() }
 
+    /// Which geometry the plan and the pool speak: `.ds4` when the directory
+    /// carries a deepseek4 GGUF (header read only), `.qwen` otherwise.
+    var profile: GeometryProfile {
+        (try? Engine.ds4GGUF(in: modelURL)) != nil ? .ds4 : .qwen
+    }
+
+    /// Total on-disk weights for /api/tags: the pinned manifest for Qwen, the
+    /// GGUF files themselves for DS4.
+    func weightsOnDiskBytes() -> Int {
+        if profile == .ds4 {
+            let fm = FileManager.default
+            if let entries = try? fm.contentsOfDirectory(at: modelURL, includingPropertiesForKeys: [.fileSizeKey]) {
+                return entries.filter { $0.pathExtension.lowercased() == "gguf" }
+                    .reduce(0) { $0 + ((try? $1.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0) }
+            }
+            return 0
+        }
+        return Int(PinnedModel.totalBytes)
+    }
+
     func mtpMode() throws -> Planner.MTPMode {
         guard let m = Planner.MTPMode(rawValue: mtp) else {
             throw PlanError("--mtp must be auto, on, or off (got \(mtp))")
@@ -219,7 +239,8 @@ struct ModelOptions: ParsableArguments {
             ramPercent: maxRAMPercent,
             mtp: mtpMode(), mtpAvailable: MTPWeights.present(modelDir: modelURL),
             vision: visionMode(), visionAvailable: visionAvailable(),
-            maxContextTokens: maxContext)
+            maxContextTokens: maxContext,
+            profile: profile)
         FileHandle.standardError.write((plan.banner() + "\n").data(using: .utf8)!)
         return plan
     }
@@ -232,7 +253,11 @@ struct ModelOptions: ParsableArguments {
         let fm = FileManager.default
         guard model == PinnedModel.name || model == PinnedModel.dirName else {
             // explicit path: all we can check cheaply is that a model is there
-            guard fm.fileExists(atPath: url.appendingPathComponent("config.json").path) else {
+            // — a config.json (safetensors checkpoint) or a deepseek4 GGUF,
+            // which the engine dispatches on.
+            let hasConfig = fm.fileExists(atPath: url.appendingPathComponent("config.json").path)
+            let hasDS4 = (try? Engine.ds4GGUF(in: url)) != nil
+            guard hasConfig || hasDS4 else {
                 throw PlanError("no model at \(url.path) — download it first with:  slotstream pull")
             }
             return
@@ -370,12 +395,13 @@ struct Run: ParsableCommand {
                 })
                 print("")
                 let hs = String(format: "%.3f", stats.expertHitRate)
-                let perLayer = String(format: "~%.0f/%d experts per layer", plan.expertsPerLayerCached, Geometry.expertsPerLayer)
+                let perLayer = String(format: "~%.0f/%d experts per layer", plan.expertsPerLayerCached, engine.model.expertsPerLayer)
+                let recordGB = engine.profile.recordBytes / 1e9
                 FileHandle.standardError.write(
                     """
 
                     -- prefill \(stats.prefillTokens) tok in \(String(format: "%.2f", stats.prefillSeconds))s (\(String(format: "%.1f", stats.prefillTPS)) tok/s)\(stats.prefixHit ? " | \(stats.reusedPrefixTokens) of \(stats.promptTokens) reused from the previous turn" : "")
-                    -- prefill split: io \(String(format: "%.2f", stats.prefillIOSeconds))s + scatter \(String(format: "%.2f", stats.prefillScatterSeconds))s + compute \(String(format: "%.2f", max(0, stats.prefillSeconds - stats.prefillIOSeconds - stats.prefillScatterSeconds)))s | \(stats.prefillRecords) records (\(String(format: "%.1f", Double(stats.prefillRecords) * 2.7648e-3)) GB, \(String(format: "%.1f", Double(stats.prefillRecords) * 2.7648e-3 / max(stats.prefillIOSeconds, 1e-9))) GB/s)
+                    -- prefill split: io \(String(format: "%.2f", stats.prefillIOSeconds))s + scatter \(String(format: "%.2f", stats.prefillScatterSeconds))s + compute \(String(format: "%.2f", max(0, stats.prefillSeconds - stats.prefillIOSeconds - stats.prefillScatterSeconds)))s | \(stats.prefillRecords) records (\(String(format: "%.1f", Double(stats.prefillRecords) * recordGB)) GB, \(String(format: "%.1f", Double(stats.prefillRecords) * recordGB / max(stats.prefillIOSeconds, 1e-9))) GB/s)
                     -- decode \(stats.decodeTokens) tok in \(String(format: "%.2f", stats.decodeSeconds))s (\(String(format: "%.2f", stats.decodeTPS)) tok/s)
                     \(RouterTrace.flush().map { $0 + "\n" } ?? "")\(MemTrace.on ? MemTrace.report() + "\n" : "")-- decode split: io \(String(format: "%.2f", stats.decodeIOSeconds))s + scatter \(String(format: "%.2f", stats.decodeScatterSeconds))s + compute \(String(format: "%.2f", max(0, stats.decodeSeconds - stats.decodeIOSeconds - stats.decodeScatterSeconds)))s | \(stats.decodeRecords) records\(stats.verifyPasses > 0 ? String(format: " | mtp %d/%d drafts accepted (%.0f%%), %d verify passes", stats.acceptedDrafts, stats.draftedTokens, 100 * stats.draftAcceptRate, stats.verifyPasses) : "")
                     -- expert cache \(perLayer), hit rate \(hs) | ngram rows \(stats.ngramRowHits)h/\(stats.ngramRowMisses)m | peak \(String(format: "%.1f", stats.peakMemoryGB)) GB | total \(String(format: "%.1f", -t0.timeIntervalSinceNow))s
@@ -462,7 +488,7 @@ struct Serve: ParsableCommand {
         }
         defer { governor?.stop() }
         let server = Server(
-            engine: engine, port: port, weightsBytes: Int(PinnedModel.totalBytes),
+            engine: engine, port: port, weightsBytes: model.weightsOnDiskBytes(),
             listenFD: listenFD)
         try server.run()
     }
@@ -598,6 +624,7 @@ struct Doctor: ParsableCommand {
         // --json is for machines: emit the plan and nothing else.
         let quiet = asJSON
         let info = MLX.GPU.deviceInfo()
+        let prof = model.profile
         if !quiet {
             print("device: \(info.architecture)  |  "
                 + String(format: "%.0f GB RAM (%.1f GB reclaimable now), %.1f GB Metal working set",
@@ -605,8 +632,15 @@ struct Doctor: ParsableCommand {
                          Planner.deviceAvailableGB() ?? .nan, Planner.deviceWorkingSetGB()))
         }
         if !quiet {
-            print("model:  \(Geometry.layers) layers x \(Geometry.expertsPerLayer) experts x 2.76 MB "
-                + "(\(Geometry.totalRecords) records = 67.9 GB streamed from SSD)")
+            switch prof.kind {
+            case .qwen:
+                print("model:  \(Geometry.layers) layers x \(Geometry.expertsPerLayer) experts x 2.76 MB "
+                    + "(\(Geometry.totalRecords) records = 67.9 GB streamed from SSD)")
+            case .ds4:
+                print("model:  deepseek4 (GGUF) — \(prof.layers) layers x \(prof.expertsPerLayer) experts x "
+                    + String(format: "%.2f MB", prof.recordBytes / 1e6)
+                    + String(format: " (%d records = %.1f GB streamed from SSD)", prof.totalRecords, prof.gb(prof.totalRecords)))
+            }
         }
         // Disk is the gate that bites before memory does, and the README sends
         // people here *before* they download, so answer that question too.
@@ -632,7 +666,8 @@ struct Doctor: ParsableCommand {
                 maxContextTokens: maxContext),
             on: device,
             mtpAvailable: MTPWeights.present(modelDir: model.modelURL),
-            visionAvailable: model.visionAvailable())
+            visionAvailable: model.visionAvailable(),
+            profile: prof)
         if asJSON {
             let data = try JSONSerialization.data(
                 withJSONObject: plan.json(), options: [.prettyPrinted, .sortedKeys])
@@ -640,6 +675,19 @@ struct Doctor: ParsableCommand {
             return
         }
         print(plan.banner())
+        if prof.kind == .ds4 {
+            // The Qwen table below is anchored on measured Qwen ladders; DS4
+            // has none yet, so doctor stops at the plan instead of quoting it.
+            print("""
+
+            (DS4 estimates above are UNMEASURED conservative ceilings — no decode or
+            prefill point has been measured on this architecture yet. The expert-pool
+            knob still works: --experts-per-layer N sizes N of \(prof.expertsPerLayer) per layer,
+            pool = N x \(String(format: "%.2f", prof.gbPerExpertPerLayer)) GB. The prefix cache, MTP and the prefill
+            sweep are not built for DS4 in this cut.)
+            """)
+            return
+        }
         print("""
 
         knobs (first one given wins; with none, auto is the default):
@@ -725,16 +773,16 @@ struct ElasticCheck: ParsableCommand {
                     let t0 = Date()
                     let out = engine.generate(promptIds: ids, params: p).text
                     FileHandle.standardError.write(String(
-                        format: "  %@ (%d slots): %.1fs\n", label, engine.model.pool.slots,
+                        format: "  %@ (%d slots): %.1fs\n", label, engine.model.qwenModel.pool.slots,
                         -t0.timeIntervalSinceNow).data(using: .utf8)!)
                     return out
                 }
                 let a = gen("baseline    ")
-                engine.withExclusive { engine.model.pool.resize(to: big); engine.publishPoolSnapshot() }
+                engine.withExclusive { engine.model.qwenModel.pool.resize(to: big); engine.publishPoolSnapshot() }
                 let b = gen("after grow  ")
-                engine.withExclusive { engine.model.pool.resize(to: smallSlots); engine.publishPoolSnapshot() }
+                engine.withExclusive { engine.model.qwenModel.pool.resize(to: smallSlots); engine.publishPoolSnapshot() }
                 let c = gen("after shrink")
-                engine.withExclusive { engine.model.pool.resize(to: 800); engine.publishPoolSnapshot() }
+                engine.withExclusive { engine.model.qwenModel.pool.resize(to: 800); engine.publishPoolSnapshot() }
                 let d = gen("after regrow")
                 if a == b, b == c, c == d {
                     print("ELASTIC CHECK PASS: 4 generations byte-identical across "
@@ -845,7 +893,7 @@ struct ElasticDrill: ParsableCommand {
                 defer { gov.stop() }
 
                 let before = gen()
-                let s0 = engine.model.pool.slots
+                let s0 = engine.model.qwenModel.pool.slots
                 note(String(format: "  start:  %d slots (~%.0f/layer) -> %@",
                     s0, Geometry.perLayer(s0), before))
 
@@ -857,7 +905,7 @@ struct ElasticDrill: ParsableCommand {
                     ramPercent: plan.ramPercent)
                 let startCache = engine.prefixCache.maxTokens
                 gov.pollNow()
-                let s1 = engine.model.pool.slots
+                let s1 = engine.model.qwenModel.pool.slots
                 let underPressure = gen()
                 note(String(format: "  squeeze: %d slots (~%.0f/layer) -> %@",
                     s1, Geometry.perLayer(s1), underPressure))
@@ -924,7 +972,7 @@ struct ElasticDrill: ParsableCommand {
                     Geometry.gb((GovernorPolicy.desiredSlots(recoveryInputs) ?? s1) - s1)))
                 Planner.availabilityOverride = recoveryAvailability
                 gov.pollNow()
-                if engine.model.pool.slots != s1 {
+                if engine.model.qwenModel.pool.slots != s1 {
                     fail.append("governor grew during the cooldown (should wait \(Int(GovernorPolicy.growCooldown)) s)")
                 } else {
                     note("  cooldown: held at \(s1) slots, as designed")
@@ -935,7 +983,7 @@ struct ElasticDrill: ParsableCommand {
                     try await Task.sleep(
                         for: .seconds(GovernorPolicy.growCooldown + 3))
                     gov.pollNow()
-                    let s2 = engine.model.pool.slots
+                    let s2 = engine.model.qwenModel.pool.slots
                     let recovered = gen()
                     note(String(format: "  recover: %d slots (~%.0f/layer) -> %@",
                         s2, Geometry.perLayer(s2), recovered))
@@ -1006,27 +1054,27 @@ struct PrefixCheck: ParsableCommand {
         func vec(_ a: MLXArray) -> [Float] {
             a.reshaped([-1]).asType(.float32).asArray(Float.self)
         }
-        let st = engine.model.makeState()
+        let st = engine.model.qwenModel.makeState()
         switch how {
         case .whole:
-            return vec(engine.model.lastLogits(ids, state: st))
+            return vec(engine.model.qwenModel.lastLogits(ids, state: st))
         case .chunked(let c):
             var i = 0
             var last = MLXArray(0)
             while i < ids.count {
                 let hi = min(i + c, ids.count)
                 if hi == ids.count {
-                    last = engine.model.lastLogits(Array(ids[i ..< hi]), state: st)
+                    last = engine.model.qwenModel.lastLogits(Array(ids[i ..< hi]), state: st)
                 } else {
-                    eval(engine.model.hiddenStates(Array(ids[i ..< hi]), state: st))
+                    eval(engine.model.qwenModel.hiddenStates(Array(ids[i ..< hi]), state: st))
                 }
                 i = hi
             }
             return vec(last)
         case .incremental(let split):
-            eval(engine.model.hiddenStates(Array(ids[0 ..< split]), state: st))
+            eval(engine.model.qwenModel.hiddenStates(Array(ids[0 ..< split]), state: st))
             var last = MLXArray(0)
-            for t in ids[split...] { last = engine.model.lastLogits([t], state: st) }
+            for t in ids[split...] { last = engine.model.qwenModel.lastLogits([t], state: st) }
             return vec(last)
         }
     }

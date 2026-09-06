@@ -71,7 +71,7 @@ public final class Qwen4ExpModel {
         try Geometry.check(against: index.config, recordBytes: store.recordBytes)
         // parity rigs keep the truncated layers' experts resident? no — pool serves them
         self.resident = try ResidentWeights(index: index)
-        self.pool = SlotPool(slots: poolSlots, store: store)
+        self.pool = SlotPool(slots: poolSlots, source: .qwen(store))
         self.ngram = NgramStore(index: index, resident: resident)
         self.rope = Rope(dim: cfg.rotaryDim, base: cfg.ropeTheta)
 

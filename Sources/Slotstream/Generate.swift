@@ -203,7 +203,11 @@ public struct Sampler {
 }
 
 public final class Generator {
-    public let model: Qwen4ExpModel
+    /// The model being driven. Dispatched once per generate() call into
+    /// concrete branches — the Qwen loop runs against `Qwen4ExpModel`, the
+    /// DS4 loop against `DS4Model`; nothing on either hot path is an
+    /// existential (see the EngineModel design note in Engine.swift).
+    public let model: EngineModel
     /// Tokens per prefill pass. Bigger is faster on long prompts: a chunk
     /// activates nearly every expert of every layer, so the expert stream is
     /// re-read roughly once per chunk and halving the chunk count halves the
@@ -248,7 +252,7 @@ public final class Generator {
         set { sampler.rngState = newValue }
     }
 
-    public init(model: Qwen4ExpModel) {
+    public init(model: EngineModel) {
         self.model = model
     }
 
@@ -266,6 +270,17 @@ public final class Generator {
         shouldContinue: (() -> Bool)? = nil,
         onToken: ((Int) -> Bool)? = nil
     ) -> ([Int], GenStats) {
+        if let ds4 = model.ds4 {
+            return generateDS4(
+                ds4, promptIds: promptIds, params: params, eosIds: eosIds,
+                shouldContinue: shouldContinue, onToken: onToken)
+        }
+        // The Qwen path below is the shipped loop, unchanged. Binding the
+        // concrete model to a local `model` keeps every line after this
+        // exactly as it was.
+        guard case .qwen(let model) = self.model else {
+            preconditionFailure("unreachable: DS4 dispatched above")
+        }
         let params = params.sanitized()
         if let s = params.seed { rngState = s == 0 ? 0xDEAD_BEEF : s }
         var stats = GenStats()
@@ -601,6 +616,127 @@ public final class Generator {
 }
 
 extension Generator {
+    /// The DeepSeek-V4-Flash loop. Same prefill/decode shape and the same
+    /// sampler as the Qwen loop; what it does NOT have in this first cut, and
+    /// why:
+    ///
+    /// - **No conversation prefix cache.** PrefixCache holds
+    ///   `Qwen4ExpModel.State`; the engine hands nil (see Engine.init) and no
+    ///   DS4 state is stored or reused. Follow-up: an EngineState box plus a
+    ///   DS4 `prefix-check` equivalent before reuse goes live.
+    /// - **No MTP / speculative decode.** DS4 declares nextn_predict_layers 1
+    ///   but no draft-head artifact is wired here; the engine refuses --mtp on.
+    /// - **No disk KV tier.** DiskCache round-trips Qwen state checkpoints.
+    /// - **No prefill sweep.** Passes of 2+ tokens read each token's routed
+    ///   experts straight from the GGUF (`DS4ExpertStore.readBatch`) and never
+    ///   touch the pool — the same scan resistance the Qwen sweep provides,
+    ///   without the grouped-GEMM speed. Follow-up: port the sweep
+    ///   (SweepTuning + staging groups) onto DS4ExpertStore.readRuns.
+    ///
+    /// The pool serves the decode step only (`DS4Model.routedExpertsViaPool`):
+    /// one token routes 6 experts per layer, so ensure() pins at most 6 slots
+    /// and the pool works as a warm cache across tokens exactly as Qwen's
+    /// does. Larger passes stay off the pool because a partial chunk can
+    /// route thousands of unique experts and `ensure` pins what it maps —
+    /// the same reason the Qwen sweep reads from the checkpoint instead.
+    ///
+    /// IO failures (a short pread, exhausted staging) reach here from the
+    /// throw-free decode loop as fatal, matching the Qwen pool path, whose
+    /// store aborts the process on the same conditions.
+    func generateDS4(
+        _ model: DS4Model, promptIds: [Int], params: SampleParams, eosIds: Set<Int>,
+        shouldContinue: (() -> Bool)? = nil,
+        onToken: ((Int) -> Bool)? = nil
+    ) -> ([Int], GenStats) {
+        let params = params.sanitized()
+        if let s = params.seed { rngState = s == 0 ? 0xDEAD_BEEF : s }
+        var stats = GenStats()
+        // An empty prompt would leave `logits` at its placeholder value; the
+        // engine rejects it at the API boundary and this is the backstop.
+        guard !promptIds.isEmpty else { return ([], stats) }
+        stats.promptTokens = promptIds.count
+        MLX.Memory.peakMemory = 0
+        model.pool.resetStats()
+        let state = model.makeState()
+
+        func fatal(_ error: Error) -> Never {
+            fatalError("DS4 expert stream failed: \(error)")
+        }
+
+        // ---- prefill in chunks. Only the last pass produces logits: the
+        // head is per-row, so slicing the hidden to the last position before
+        // it skips the [chunk, 129280] logits transient on every earlier pass.
+        var t0 = Date()
+        var logits: MLXArray = MLXArray(0)
+        var i = 0
+        if !promptIds.isEmpty { onPrefillProgress?(0, promptIds.count, 0) }
+        while i < promptIds.count {
+            if let keepGoing = shouldContinue, !keepGoing() {
+                stats.finishReason = "stop"
+                stats.prefillTokens = i
+                stats.prefillSeconds = -t0.timeIntervalSinceNow
+                stats.peakMemoryGB = ProcessMemory.peakResidentGB
+                stats.mlxPeakMemoryGB = Double(MLX.Memory.peakMemory) / 1e9
+                return ([], stats)
+            }
+            let hi = min(i + PrefillSchedule.chunk(at: i, maxChunk: prefillChunk), promptIds.count)
+            let chunk = Array(promptIds[i ..< hi])
+            do {
+                if hi == promptIds.count {
+                    logits = try model.lastLogits(chunk, state: state)
+                    eval(logits)
+                } else {
+                    let h = try model.hiddenStates(chunk, state: state)
+                    eval(h)
+                }
+            } catch {
+                fatal(error)
+            }
+            i = hi
+            onPrefillProgress?(i, promptIds.count, -t0.timeIntervalSinceNow)
+        }
+        stats.prefillTokens = promptIds.count
+        stats.prefillSeconds = -t0.timeIntervalSinceNow
+        stats.prefillIOSeconds = model.pool.ioSeconds
+        stats.prefillScatterSeconds = model.pool.scatterSeconds
+        stats.prefillRecords = model.pool.recordsFetched
+        model.pool.resetStats()
+
+        // ---- decode. Sampling, stop and cancellation follow the Qwen loop
+        // exactly; the sampler is model-agnostic (logits in, token out).
+        var out: [Int] = []
+        var generated = Set<Int>()
+        var reason = "length"
+        t0 = Date()
+        for _ in 0 ..< max(0, params.maxTokens) {
+            if let keepGoing = shouldContinue, !keepGoing() { reason = "stop"; break }
+            let tok = sample(logits, params: params, generated: generated)
+            if eosIds.contains(tok) { reason = "stop"; break }
+            out.append(tok)
+            generated.insert(tok)
+            // The callback stops the run for a stop sequence or a gone client.
+            if let cb = onToken, !cb(tok) { reason = "stop"; break }
+            do {
+                logits = try model.lastLogits([tok], state: state)
+            } catch {
+                fatal(error)
+            }
+            eval(logits)
+        }
+        stats.finishReason = reason
+        stats.decodeTokens = out.count
+        stats.decodeSeconds = -t0.timeIntervalSinceNow
+        stats.expertHitRate = model.pool.hitRate
+        stats.decodeIOSeconds = model.pool.ioSeconds
+        stats.decodeScatterSeconds = model.pool.scatterSeconds
+        stats.decodeRecords = model.pool.recordsFetched
+        stats.mlxPeakMemoryGB = Double(MLX.Memory.peakMemory) / 1e9
+        stats.peakMemoryGB = ProcessMemory.peakResidentGB
+        return (out, stats)
+    }
+}
+
+extension Generator {
     /// Self-speculative decode with the MTP draft head. One round:
     ///
     ///   1. draft `draftDepth` tokens greedily by chaining the head
@@ -631,6 +767,9 @@ extension Generator {
         out: inout [Int], generated: inout Set<Int>, reason: inout String,
         consumed: inout [Int], stats: inout GenStats
     ) {
+        guard case .qwen(let model) = self.model else {
+            preconditionFailure("speculative decode is a Qwen path")
+        }
         // The first token comes off the prefill logits exactly like the
         // plain loop's first iteration.
         var pending: Int? = nil

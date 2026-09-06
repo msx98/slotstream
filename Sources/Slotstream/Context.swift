@@ -78,14 +78,19 @@ public enum PrefillSchedule {
     /// passes priced at the measured per-pass throughput anchors
     /// (Planner.estPrefillTokS). The last, partial pass is priced at the rate
     /// of the pass size it was cut from — slightly pessimistic, on purpose.
-    public static func estSeconds(tokens: Int, from position: Int = 0, maxChunk: Int) -> Double {
+    /// The pass-shrinking schedule itself is model-agnostic and conservative
+    /// for DS4 too, so only the rate is per-model here.
+    public static func estSeconds(
+        tokens: Int, from position: Int = 0, maxChunk: Int,
+        profile: GeometryProfile = .qwen
+    ) -> Double {
         var secs = 0.0
         var pos = max(0, position)
         var left = max(0, tokens)
         while left > 0 {
             let full = chunk(at: pos, maxChunk: maxChunk)
             let c = min(full, left)
-            secs += Double(c) / Planner.estPrefillTokS(chunk: full)
+            secs += Double(c) / Planner.estPrefillTokS(chunk: full, profile: profile)
             pos += c
             left -= c
         }

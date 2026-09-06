@@ -50,6 +50,69 @@ public enum Geometry {
     }
 }
 
+/// Per-model constants the planner speaks in. The Qwen row is the shipped
+/// geometry; the DS4 row sizes DeepSeek-V4-Flash from its GGUF (43 layers,
+/// 256 experts × 13,369,344 B per record — DS4ExpertStore.recordBytes).
+/// Everything the planner derived from `Geometry` statics now reads a profile
+/// instead, so one policy serves both models; the Qwen profile is *defined
+/// from* `Geometry` and `Planner`'s constants, so the two cannot drift and a
+/// Qwen plan is bit-for-bit what it always was.
+public struct GeometryProfile: Sendable, Equatable {
+    public enum Kind: String, Sendable, Equatable {
+        case qwen
+        case ds4
+    }
+
+    public let kind: Kind
+    public let layers: Int
+    public let expertsPerLayer: Int
+    /// Bytes per expert record, as a Double so the GB math matches Geometry's.
+    public let recordBytes: Double
+    public let floorSlots: Int
+    /// Non-pool process footprint (resident weights + runtime + a full active
+    /// context), charged before the pool is sized.
+    public let fixedFootprintGB: Double
+    /// Context state bytes per consumed token (attention KV + indexer).
+    public let contextBytesPerToken: Int
+
+    public static let qwen = GeometryProfile(
+        kind: .qwen,
+        layers: Geometry.layers,
+        expertsPerLayer: Geometry.expertsPerLayer,
+        recordBytes: Geometry.recordBytes,
+        floorSlots: Geometry.floorSlots,
+        fixedFootprintGB: 5.3,
+        contextBytesPerToken: PrefixCache.bytesPerToken)
+
+    /// UNMEASURED marks: 8.80 GB trunk + a conservative ~2.2 GB runtime
+    /// allowance (MLX cache cap, activations, one 32k context at ~5.8 KiB per
+    /// token) — the next task measures a real process RSS peak and replaces
+    /// this with the measured figure. Nothing here has been through a
+    /// `--memory-gb` peak run yet, so it errs high on purpose: an
+    /// over-charged footprint shrinks the pool; an under-charged one swap-storms.
+    public static let ds4 = GeometryProfile(
+        kind: .ds4,
+        layers: 43,
+        expertsPerLayer: 256,
+        recordBytes: 13_369_344,
+        floorSlots: 256,
+        fixedFootprintGB: 11.0,
+        contextBytesPerToken: 5_878)
+
+    public var totalRecords: Int { layers * expertsPerLayer }
+    public func gb(_ globalSlots: Int) -> Double { Double(globalSlots) * recordBytes / 1e9 }
+    public func perLayer(_ globalSlots: Int) -> Double { Double(globalSlots) / Double(layers) }
+    public var gbPerExpertPerLayer: Double { Double(layers) * recordBytes / 1e9 }
+
+    /// Same conversion as `Geometry.slotsForPoolGB`, on this profile's constants.
+    public func slotsForPoolGB(_ poolGB: Double) -> Int {
+        guard poolGB.isFinite else { return poolGB > 0 ? totalRecords : floorSlots }
+        if poolGB >= gb(totalRecords) { return totalRecords }
+        if poolGB <= gb(floorSlots) { return floorSlots }
+        return Int(poolGB * 1e9 / recordBytes)
+    }
+}
+
 public struct PlanError: Error, CustomStringConvertible {
     public let description: String
     public init(_ s: String) { description = s }
@@ -97,6 +160,9 @@ public struct MemoryPlan {
     /// the fixed footprint; anything above is charged separately.
     public let maxContextTokens: Int
     public let notes: [String]
+    /// Which model geometry this plan was sized against. `.qwen` everywhere
+    /// the plan predates profiles; `.ds4` for a DeepSeek-V4-Flash plan.
+    public let profile: GeometryProfile
 
     public init(
         source: Source, slots: Int, targetGB: Double?,
@@ -105,7 +171,8 @@ public struct MemoryPlan {
         prefillChunk: Int, prefixCacheTokens: Int, mtpEnabled: Bool = false,
         visionEnabled: Bool = false,
         maxContextTokens: Int = ContextPolicy.maxTokens,
-        notes: [String], simulated: Bool = false
+        notes: [String], simulated: Bool = false,
+        profile: GeometryProfile = .qwen
     ) {
         self.source = source
         self.slots = slots
@@ -122,23 +189,28 @@ public struct MemoryPlan {
         self.maxContextTokens = maxContextTokens
         self.notes = notes
         self.simulated = simulated
+        self.profile = profile
     }
 
-    public var expertsPerLayerCached: Double { Geometry.perLayer(slots) }
-    public var poolGB: Double { Geometry.gb(slots) }
+    public var expertsPerLayerCached: Double { profile.perLayer(slots) }
+    public var poolGB: Double { profile.gb(slots) }
     public var expectedPeakGB: Double {
-        poolGB + Planner.fixedFootprintGB + Planner.prefillCostGB(prefillChunk)
-            + Planner.prefixCacheCostGB(tokens: prefixCacheTokens)
+        poolGB + profile.fixedFootprintGB + Planner.prefillCostGB(prefillChunk, profile: profile)
+            + Planner.prefixCacheCostGB(tokens: prefixCacheTokens, profile: profile)
             + (mtpEnabled ? Planner.mtpResidentGB : 0)
-            + Planner.extraContextStateGB(maxContextTokens: maxContextTokens)
+            + Planner.extraContextStateGB(
+                maxContextTokens: maxContextTokens, profile: profile)
     }
     /// Seconds a prompt filling the whole context takes before its first
     /// token, priced through the prefill schedule this plan runs.
     public var estPrefillSecondsAtMaxContext: Double {
-        PrefillSchedule.estSeconds(tokens: maxContextTokens, maxChunk: prefillChunk)
+        PrefillSchedule.estSeconds(
+            tokens: maxContextTokens, maxChunk: prefillChunk, profile: profile)
     }
-    public var estWarmTokS: Double { Planner.estWarmTokS(expertsPerLayer: expertsPerLayerCached) }
-    public var fullyResident: Bool { slots >= Geometry.totalRecords }
+    public var estWarmTokS: Double {
+        Planner.estWarmTokS(profile: profile, expertsPerLayer: expertsPerLayerCached)
+    }
+    public var fullyResident: Bool { slots >= profile.totalRecords }
 
     /// The startup announce: device, decision, expectation, override hint.
     public func banner() -> String {
@@ -161,30 +233,38 @@ public struct MemoryPlan {
         if fullyResident {
             l.append(String(
                 format: "  cache:  all %d experts per layer resident (%.1f GB pool)",
-                Geometry.expertsPerLayer, poolGB))
+                profile.expertsPerLayer, poolGB))
         } else {
             l.append(String(
                 format: "  cache:  ~%.0f of %d experts per layer  (%d global slots = %.1f GB pool)",
-                expertsPerLayerCached, Geometry.expertsPerLayer, slots, poolGB))
+                expertsPerLayerCached, profile.expertsPerLayer, slots, poolGB))
+        }
+        switch profile.kind {
+        case .qwen:
+            l.append(String(
+                format: "  expect: ~%.1f GB peak, ~%.0f tok/s warm decode (est. from M5 Pro anchors)",
+                expectedPeakGB, estWarmTokS))
+            // The decode curve is a function of experts per layer alone. It carries
+            // no term for read bandwidth, and it was anchored on a 17.3 GB/s SSD
+            // (MEASUREMENTS, M0.5). The first machine measured that was not the dev
+            // Mac reads at 1.5 GB/s, where the misses of a single token cost more
+            // time than the whole estimated step (MEASUREMENTS, C1). Until the
+            // planner can measure this disk and price those reads, the estimate
+            // says out loud what it assumes rather than quietly assuming it.
+            l.append(
+                "  disk:   that estimate assumes an SSD like the one it was measured on (17.3 GB/s). "
+                    + "A base-storage Mac mini M2 reads 1.5 GB/s and decoded at 1.41 tok/s against a ~4 "
+                    + "estimate, so on base storage expect well under the number above — see docs/HARDWARE.md")
+        case .ds4:
+            l.append(String(
+                format: "  expect: ~%.1f GB peak, ~%.0f tok/s warm decode (UNMEASURED — conservative "
+                    + "ceiling; no DS4 decode point has been measured yet)",
+                expectedPeakGB, estWarmTokS))
         }
         l.append(String(
-            format: "  expect: ~%.1f GB peak, ~%.0f tok/s warm decode (est. from M5 Pro anchors)",
-            expectedPeakGB, estWarmTokS))
-        // The decode curve is a function of experts per layer alone. It carries
-        // no term for read bandwidth, and it was anchored on a 17.3 GB/s SSD
-        // (MEASUREMENTS, M0.5). The first machine measured that was not the dev
-        // Mac reads at 1.5 GB/s, where the misses of a single token cost more
-        // time than the whole estimated step (MEASUREMENTS, C1). Until the
-        // planner can measure this disk and price those reads, the estimate
-        // says out loud what it assumes rather than quietly assuming it.
-        l.append(
-            "  disk:   that estimate assumes an SSD like the one it was measured on (17.3 GB/s). "
-            + "A base-storage Mac mini M2 reads 1.5 GB/s and decoded at 1.41 tok/s against a ~4 "
-            + "estimate, so on base storage expect well under the number above — see docs/HARDWARE.md")
-        l.append(String(
             format: "  prefill: %d tokens per pass (~%.0f tok/s here; costs ~%.1f GB of the target)",
-            prefillChunk, Planner.estPrefillTokS(chunk: prefillChunk),
-            Planner.prefillCostGB(prefillChunk)))
+            prefillChunk, Planner.estPrefillTokS(chunk: prefillChunk, profile: profile),
+            Planner.prefillCostGB(prefillChunk, profile: profile)))
         if mtpEnabled {
             l.append(String(
                 format: "  mtp:    draft head on — speculative decode (%.1f GB resident, charged above)",
@@ -196,7 +276,8 @@ public struct MemoryPlan {
                     + "resident, NOT charged above; refused if the machine cannot spare it then)",
                 Planner.visionResidentGB))
         }
-        let extra = Planner.extraContextStateGB(maxContextTokens: maxContextTokens)
+        let extra = Planner.extraContextStateGB(
+            maxContextTokens: maxContextTokens, profile: profile)
         l.append(String(
             format: "  context: up to %d tokens per request (prompt + reply%@); a full-length prompt "
                 + "takes ~%@ before its first token here, follow-up turns read only what is new",
@@ -243,7 +324,8 @@ public struct MemoryPlan {
             // a step that is not there. Anything asserting on the plan should
             // read these, not the printed line.
             "est_warm_tok_s": estWarmTokS,
-            "est_prefill_tok_s": Planner.estPrefillTokS(chunk: prefillChunk),
+            "est_prefill_tok_s": Planner.estPrefillTokS(chunk: prefillChunk, profile: profile),
+            "model_profile": profile.kind.rawValue,
         ]
         if let a = availableGB, a.isFinite { d["device_available_gb"] = tenth(a) }
         if let t = targetGB { d["target_gb"] = tenth(t) }
@@ -280,22 +362,37 @@ public enum Planner {
     /// is genuinely small: going from a 4,016 to an 8,016-token prompt moved
     /// peak by 0.1 GB. 1.30 MB/token is charged here so the estimate errs high
     /// at every measured point.
-    public static func prefillCostGB(_ chunk: Int) -> Double {
-        Double(chunk) * 1.30e-3
+    public static func prefillCostGB(_ chunk: Int, profile: GeometryProfile = .qwen) -> Double {
+        switch profile.kind {
+        case .qwen:
+            return Double(chunk) * 1.30e-3
+        case .ds4:
+            // UNMEASURED. The DS4 pass transient is bounded per token (the
+            // attention loop evals per position; the routed-expert staging is
+            // freed per token) except the head: last-pass logits are
+            // [chunk, 129280] f32 ≈ 0.52 MB per chunk token. Charging a
+            // rounded-up 1.0 MB per token errs high, which is the safe
+            // direction (it shrinks the pool, it does not overcommit). The
+            // next task measures a real `--memory-gb` peak and replaces this.
+            return Double(chunk) * 1.0e-3
+        }
     }
 
     /// KV plus indexer state for a context of `tokens`, which the pool math
     /// does not model. Separate from the pass cost above because it scales with
     /// the conversation, not with the batch: a 32k prompt carries ~0.9 GB.
-    public static func contextStateGB(_ tokens: Int) -> Double {
-        Double(tokens) * Double(PrefixCache.bytesPerToken) / 1e9
+    public static func contextStateGB(_ tokens: Int, profile: GeometryProfile = .qwen) -> Double {
+        Double(tokens) * Double(profile.contextBytesPerToken) / 1e9
     }
 
     /// Context state above what the fixed footprint already covers. Zero at
     /// today's ceiling; the term exists so a raised --max-context is priced
     /// the day the ceiling moves, instead of riding on the margin.
-    public static func extraContextStateGB(maxContextTokens: Int) -> Double {
-        contextStateGB(max(0, maxContextTokens - ContextPolicy.tokensInFixedFootprint))
+    public static func extraContextStateGB(
+        maxContextTokens: Int, profile: GeometryProfile = .qwen
+    ) -> Double {
+        contextStateGB(
+            max(0, maxContextTokens - ContextPolicy.tokensInFixedFootprint), profile: profile)
     }
 
     /// Sizes the prefill pass from the same budget as the pool.
@@ -343,19 +440,35 @@ public enum Planner {
     /// the pass only grows when the prefill it buys beats the decode it costs.
     /// Swept a GB at a time from 7 to 90 GB, the estimate never gets worse as
     /// the target grows.
-    public static func prefillChunkFor(poolBudgetGB: Double) -> Int {
+    public static func prefillChunkFor(
+        poolBudgetGB: Double, profile: GeometryProfile = .qwen
+    ) -> Int {
+        switch profile.kind {
+        case .ds4:
+            // UNMEASURED. The Qwen scoring below is anchored on measured
+            // decode and prefill ladders this model does not have yet, and
+            // the repo rule is that an estimator may not return a value
+            // outside its measured range. The smallest measured-safe pass
+            // (PrefillSchedule.minChunk) is the conservative answer; revisit
+            // with the first DS4 prefill measurement.
+            return PrefillSchedule.minChunk
+        case .qwen:
+            break
+        }
         // 8192 is not a candidate: nothing has measured it, and the prefill
         // schedule would cut it to 4096 on the first pass anyway
         // (PrefillSchedule.measuredQueryKeyProduct), so offering it only
         // charged 10.6 GB for a pass that never ran.
         let candidates = [256] + [512, 1024, 2048, 4096].filter {
-            prefillCostGB($0) <= 0.25 * poolBudgetGB
+            prefillCostGB($0, profile: profile) <= 0.25 * poolBudgetGB
         }
         func seconds(_ c: Int) -> Double {
-            let pool = poolBudgetGB - prefillCostGB(c) - prefixCacheGB(poolBudgetGB: poolBudgetGB)
-            let slots = Geometry.slotsForPoolGB(max(0, pool))
-            let decode = estWarmTokS(expertsPerLayer: Geometry.perLayer(slots))
-            return tuningPromptTokens / estPrefillTokS(chunk: c) + tuningReplyTokens / decode
+            let pool = poolBudgetGB - prefillCostGB(c, profile: profile)
+                - prefixCacheGB(poolBudgetGB: poolBudgetGB, profile: profile)
+            let slots = profile.slotsForPoolGB(max(0, pool))
+            let decode = estWarmTokS(profile: profile, expertsPerLayer: profile.perLayer(slots))
+            return tuningPromptTokens / estPrefillTokS(chunk: c, profile: profile)
+                + tuningReplyTokens / decode
         }
         // Ties (identical seconds) go to the larger pass: same request time,
         // more headroom on a prompt longer than the one we tuned for.
@@ -380,7 +493,21 @@ public enum Planner {
     /// pool budget is the ceiling, capped by the context limit above which
     /// reuse is impossible anyway (a match needs `prompt.count > held.count`,
     /// and a prompt that long is already refused).
-    public static func prefixCacheTokensFor(poolBudgetGB: Double, contextCap: Int = 32_768) -> Int {
+    public static func prefixCacheTokensFor(
+        poolBudgetGB: Double, contextCap: Int = 32_768,
+        profile: GeometryProfile = .qwen
+    ) -> Int {
+        switch profile.kind {
+        case .ds4:
+            // First cut: no prefix cache for DS4. The retained state would be
+            // a DS4State box inside PrefixCache, which does not exist yet; the
+            // engine constructs its cache disabled and never hands one to the
+            // generator (see Engine). Follow-up: a DS4 state box and a
+            // prefix-check equivalent before turning this on.
+            return 0
+        case .qwen:
+            break
+        }
         let gb = 0.10 * max(0, poolBudgetGB)
         let full = Double(contextCap) * Double(PrefixCache.bytesPerToken) / 1e9
         if gb >= full { return max(0, contextCap) }
@@ -389,14 +516,20 @@ public enum Planner {
     }
 
     /// What that retention ceiling costs, which the plan reserves.
-    public static func prefixCacheGB(poolBudgetGB: Double) -> Double {
-        prefixCacheCostGB(tokens: prefixCacheTokensFor(poolBudgetGB: poolBudgetGB))
+    public static func prefixCacheGB(poolBudgetGB: Double, profile: GeometryProfile = .qwen)
+        -> Double
+    {
+        prefixCacheCostGB(tokens: prefixCacheTokensFor(poolBudgetGB: poolBudgetGB, profile: profile), profile: profile)
     }
 
     /// PrefixCache evicts before a miss allocation, so no more than four
     /// states coexist: the active state already in fixedFootprintGB plus three
     /// retained states. Their fixed GDN memory is additive to KV/indexer bytes.
-    public static func prefixCacheCostGB(tokens: Int) -> Double {
+    public static func prefixCacheCostGB(tokens: Int, profile: GeometryProfile = .qwen) -> Double {
+        switch profile.kind {
+        case .ds4: return 0  // no DS4 prefix cache in this cut
+        case .qwen: break
+        }
         guard tokens > 0 else { return 0 }
         let tokenGB = Double(tokens) * Double(PrefixCache.bytesPerToken) / 1e9
         let fixedGB = Double(PrefixCache.maxEntries - 1)
@@ -421,7 +554,21 @@ public enum Planner {
     /// a bigger cache means fewer expert misses per pass. The same chunk gives
     /// 88 tok/s at 60 experts/layer and 113 at 67, so treat these as typical
     /// for a machine that would *choose* that chunk, not as a pure function.
-    public static func estPrefillTokS(chunk: Int) -> Double {
+    public static func estPrefillTokS(chunk: Int, profile: GeometryProfile = .qwen) -> Double {
+        switch profile.kind {
+        case .ds4:
+            // UNMEASURED, and deliberately NOT a ladder: no DS4 prefill rate
+            // has been measured, so there is nothing to interpolate. A pass
+            // reads ~3.45 GB of expert records per token (43 layers x 6
+            // experts x 13.37 MB, all misses — the pool is decode-only in
+            // this cut), so even a 17.3 GB/s SSD bounds the pass near 5 tok/s
+            // before compute; 2.0 is quoted so the estimate under-promises
+            // rather than over, per the estimator rule. Replace with the
+            // first measured point.
+            return 2.0
+        case .qwen:
+            break
+        }
         // The sweep's ladder on the 8k acceptance prompt at a matched pool of
         // 60 experts per layer (MEASUREMENTS.md, "N2 — the prefill sweep"):
         // 88 / 128 / 169 / 211 / 222 tok/s from 256 to 4096, rounded down.
@@ -438,8 +585,12 @@ public enum Planner {
         }
     }
     /// Smallest honest total-memory target: floor pool + footprint + margin.
-    public static var minMemoryGB: Double {
-        ((Geometry.gb(Geometry.floorSlots) + fixedFootprintGB + planningMarginGB) * 10)
+    /// The Qwen shorthand `minMemoryGB` stays for the existing callers and the
+    /// doctor table; DS4 passes its profile explicitly.
+    public static var minMemoryGB: Double { minMemoryGBFor(.qwen) }
+
+    public static func minMemoryGBFor(_ profile: GeometryProfile) -> Double {
+        ((profile.gb(profile.floorSlots) + profile.fixedFootprintGB + planningMarginGB) * 10)
             .rounded(.up) / 10
     }
 
@@ -567,6 +718,18 @@ public enum Planner {
         return r0 * pow(r1 / r0, t)
     }
 
+    /// Per-model dispatch. The Qwen curve above is a function of cached
+    /// experts per layer; DS4 has no measured decode point, so it returns one
+    /// conservative constant flagged UNMEASURED (same reasoning as
+    /// `estPrefillTokS` — a planner that quotes a speed nothing measured is
+    /// worse than one that quotes less).
+    public static func estWarmTokS(profile: GeometryProfile, expertsPerLayer e: Double) -> Double {
+        switch profile.kind {
+        case .ds4: return 2.0
+        case .qwen: return estWarmTokS(expertsPerLayer: e)
+        }
+    }
+
     /// Resident cost of the MTP draft head (mtp.safetensors is 1.47 GB;
     /// activations and cache growth ride the existing margins).
     public static let mtpResidentGB = 1.6
@@ -600,15 +763,17 @@ public enum Planner {
     public static let mtpAutoFloorPerLayer = 120.0
 
     /// Pool budget before the prefill pass takes its share.
-    public static func poolBudgetGB(_ targetGB: Double) -> Double {
-        targetGB - fixedFootprintGB - planningMarginGB
+    public static func poolBudgetGB(_ targetGB: Double, profile: GeometryProfile = .qwen)
+        -> Double
+    {
+        targetGB - profile.fixedFootprintGB - planningMarginGB
     }
 
-    public static func slotsForTarget(_ targetGB: Double) -> Int {
-        let budget = poolBudgetGB(targetGB)
-        let pool = budget - prefillCostGB(prefillChunkFor(poolBudgetGB: budget))
-            - prefixCacheGB(poolBudgetGB: budget)
-        return Geometry.slotsForPoolGB(pool)
+    public static func slotsForTarget(_ targetGB: Double, profile: GeometryProfile = .qwen) -> Int {
+        let budget = poolBudgetGB(targetGB, profile: profile)
+        let pool = budget - prefillCostGB(prefillChunkFor(poolBudgetGB: budget, profile: profile), profile: profile)
+            - prefixCacheGB(poolBudgetGB: budget, profile: profile)
+        return profile.slotsForPoolGB(pool)
     }
 
     /// Resolve the knobs. Precedence: --experts-per-layer > --pool-gb >
@@ -635,11 +800,12 @@ public enum Planner {
         mtp: MTPMode = .off, mtpAvailable: Bool = false,
         vision: VisionMode = .auto, visionAvailable: Bool = false,
         maxContextTokens: Int = ContextPolicy.maxTokens,
-        simulated: Bool = false
+        simulated: Bool = false,
+        profile: GeometryProfile = .qwen
     ) throws -> MemoryPlan {
         if let why = ContextPolicy.validationError(maxContextTokens) { throw PlanError(why) }
         // Zero at today's ceiling (Context.swift); charged the day it moves.
-        let contextCharge = extraContextStateGB(maxContextTokens: maxContextTokens)
+        let contextCharge = extraContextStateGB(maxContextTokens: maxContextTokens, profile: profile)
         let ram = ramGB ?? deviceRAMGB()
         let ws = workingSetGB ?? deviceWorkingSetGB()
         let avail = availableGB ?? deviceAvailableGB()
@@ -687,7 +853,7 @@ public enum Planner {
             case .on: return true
             case .auto:
                 return mtpAvailable
-                    && Geometry.perLayer(slotsAfterCharge) >= mtpAutoFloorPerLayer
+                    && profile.perLayer(slotsAfterCharge) >= mtpAutoFloorPerLayer
             }
         }
 
@@ -697,18 +863,19 @@ public enum Planner {
             // An explicit pool knob states the cache size, not the whole budget,
             // so size the prefill pass from the pool the user asked for.
             let mtpCharge = mtpOn ? mtpResidentGB : 0
-            let budgetForCaches = target.map { poolBudgetGB($0) - mtpCharge - contextCharge }
-                ?? Geometry.gb(slots)
-            let chunk = prefillChunkFor(poolBudgetGB: budgetForCaches)
-            let capped = min(slots, Geometry.totalRecords)
-            let floored = max(capped, Geometry.floorSlots)
+            let budgetForCaches = target.map { poolBudgetGB($0, profile: profile) - mtpCharge - contextCharge }
+                ?? profile.gb(slots)
+            let chunk = prefillChunkFor(poolBudgetGB: budgetForCaches, profile: profile)
+            let capped = min(slots, profile.totalRecords)
+            let floored = max(capped, profile.floorSlots)
             if floored > capped {
                 notes.append(String(
                     format: "raised to the floor of %d slots (~%.0f/layer): below it a prefill chunk can pin every slot",
-                    Geometry.floorSlots, Geometry.perLayer(Geometry.floorSlots)))
+                    profile.floorSlots, profile.perLayer(profile.floorSlots)))
             }
-            let peak = Geometry.gb(floored) + fixedFootprintGB + prefillCostGB(chunk)
-                + prefixCacheGB(poolBudgetGB: budgetForCaches) + mtpCharge + contextCharge
+            let peak = profile.gb(floored) + profile.fixedFootprintGB
+                + prefillCostGB(chunk, profile: profile)
+                + prefixCacheGB(poolBudgetGB: budgetForCaches, profile: profile) + mtpCharge + contextCharge
             if peak > ws, source != .memoryGB {  // memoryGB branch words its own note
                 notes.append(String(
                     format: "expected peak %.1f GB exceeds the %.1f GB Metal working set — expect paging; close other apps or lower the knob",
@@ -726,19 +893,21 @@ public enum Planner {
                 availableGB: avail, clamped: clamped,
                 prefillChunk: chunk,
                 prefixCacheTokens: prefixCacheTokensFor(
-                    poolBudgetGB: budgetForCaches, contextCap: maxContextTokens),
+                    poolBudgetGB: budgetForCaches, contextCap: maxContextTokens,
+                    profile: profile),
                 mtpEnabled: mtpOn,
                 visionEnabled: visionOn,
                 maxContextTokens: maxContextTokens,
                 notes: notes,
-                simulated: simulated)
+                simulated: simulated,
+                profile: profile)
         }
 
         if let n = expertsPerLayer {
             guard n >= 1 else { throw PlanError("--experts-per-layer must be ≥ 1") }
             if poolGB != nil { notes.append("--pool-gb ignored (--experts-per-layer takes precedence)") }
             if memoryGB != nil { notes.append("--memory-gb ignored (--experts-per-layer takes precedence)") }
-            let slots = min(n, Geometry.expertsPerLayer) * Geometry.layers
+            let slots = min(n, profile.expertsPerLayer) * profile.layers
             return finish(.expertsPerLayer, slots, target: nil, mtpOn: resolveMTP(slotsAfterCharge: slots))
         }
         if let g = poolGB {
@@ -748,23 +917,30 @@ public enum Planner {
             if memoryGB != nil { notes.append("--memory-gb ignored (--pool-gb takes precedence)") }
             // Preserve a below-floor request so `finish` can explain that it
             // raised it; cap before Double->Int so huge finite input is safe.
-            let requested = g >= Geometry.gb(Geometry.totalRecords)
-                ? Geometry.totalRecords : Int(g * 1e9 / Geometry.recordBytes)
+            let requested = g >= profile.gb(profile.totalRecords)
+                ? profile.totalRecords : Int(g * 1e9 / profile.recordBytes)
             return finish(.poolGB, requested, target: nil, mtpOn: resolveMTP(slotsAfterCharge: requested))
         }
         if let m = memoryGB {
             guard m.isFinite else { throw PlanError("--memory-gb must be finite") }
-            guard m >= minMemoryGB else {
+            guard m >= minMemoryGBFor(profile) else {
+                // The Qwen wording is load-bearing text gates may match; only
+                // DS4 (which has no n-gram cache) says "runtime".
+                let footprint: String
+                switch profile.kind {
+                case .qwen: footprint = "resident weights + n-gram cache"
+                case .ds4: footprint = "resident weights + runtime"
+                }
                 throw PlanError(String(
-                    format: "--memory-gb %.1f is below the minimum %.1f GB (floor cache of ~%.0f experts/layer = %.1f GB pool, plus the %.1f GB fixed footprint of resident weights + n-gram cache, plus %.1f GB margin)",
-                    m, minMemoryGB, Geometry.perLayer(Geometry.floorSlots),
-                    Geometry.gb(Geometry.floorSlots), fixedFootprintGB,
-                    planningMarginGB))
+                    format: "--memory-gb %.1f is below the minimum %.1f GB (floor cache of ~%.0f experts/layer = %.1f GB pool, plus the %.1f GB fixed footprint of %@, plus %.1f GB margin)",
+                    m, minMemoryGBFor(profile), profile.perLayer(profile.floorSlots),
+                    profile.gb(profile.floorSlots), profile.fixedFootprintGB,
+                    footprint, planningMarginGB))
             }
             if m > ws {
                 notes.append(String(
                     format: "target %.1f GB exceeds the %.1f GB Metal working set; the OS may page — auto would pick %.1f GB here",
-                    m, ws, max(minMemoryGB, autoTargetGB(ramGB: ram, workingSetGB: ws, ramPercent: pct))))
+                    m, ws, max(minMemoryGBFor(profile), autoTargetGB(ramGB: ram, workingSetGB: ws, ramPercent: pct))))
             }
             if let a = avail, m > a {
                 notes.append(String(
@@ -772,16 +948,18 @@ public enum Planner {
                     a))
             }
             var mtpOn = resolveMTP(
-                slotsAfterCharge: slotsForTarget(max(m - mtpResidentGB - contextCharge, minMemoryGB)))
-            if mtpOn, m - mtpResidentGB - contextCharge < minMemoryGB {
+                slotsAfterCharge: slotsForTarget(
+                    max(m - mtpResidentGB - contextCharge, minMemoryGBFor(profile)),
+                    profile: profile))
+            if mtpOn, m - mtpResidentGB - contextCharge < minMemoryGBFor(profile) {
                 if mtp == .on {
                     throw PlanError(String(
                         format: "--memory-gb %.1f cannot fit the %.1f GB draft head above the %.1f GB minimum — raise the target or drop --mtp on",
-                        m, mtpResidentGB, minMemoryGB))
+                        m, mtpResidentGB, minMemoryGBFor(profile)))
                 }
                 mtpOn = false
             }
-            let slots = slotsForTarget(m - (mtpOn ? mtpResidentGB : 0) - contextCharge)
+            let slots = slotsForTarget(m - (mtpOn ? mtpResidentGB : 0) - contextCharge, profile: profile)
             return finish(.memoryGB, slots, target: m, mtpOn: mtpOn)
         }
 
@@ -803,11 +981,11 @@ public enum Planner {
         var mtpOn = false
         if mtpWanted {
             let (rawM, _) = autoRaw(ceilingGB: usefulCeilingGB + mtpResidentGB)
-            let targetM = max(minMemoryGB, rawM)
+            let targetM = max(minMemoryGBFor(profile), rawM)
             let charged = targetM - mtpResidentGB - contextCharge
-            mtpOn = charged >= minMemoryGB
+            mtpOn = charged >= minMemoryGBFor(profile)
                 && (mtp == .on
-                    || Geometry.perLayer(slotsForTarget(charged)) >= mtpAutoFloorPerLayer)
+                    || profile.perLayer(slotsForTarget(charged, profile: profile)) >= mtpAutoFloorPerLayer)
         }
         // `ceiling` is what this machine's auto would pick unclamped (the
         // notes below compare against it); the knee itself rises by the
@@ -817,31 +995,33 @@ public enum Planner {
             ramGB: ram, workingSetGB: ws, ramPercent: pct, ceilingGB: kneeGB)
         let raw: Double
         (raw, clamped) = autoRaw(ceilingGB: kneeGB)
-        let target = max(minMemoryGB, raw)
-        if mtpOn, target - mtpResidentGB - contextCharge < minMemoryGB { mtpOn = false }
+        let target = max(minMemoryGBFor(profile), raw)
+        if mtpOn, target - mtpResidentGB - contextCharge < minMemoryGBFor(profile) { mtpOn = false }
         // Exactly one note tells the story of why the target is what it is.
-        if raw < minMemoryGB, ceiling < minMemoryGB {
+        if raw < minMemoryGBFor(profile), ceiling < minMemoryGBFor(profile) {
             notes.append(String(
                 format: "this machine (%.0f GB RAM) is below the comfortable minimum — running at the %.1f GB floor; expect slow decode and close other apps",
-                ram, minMemoryGB))
-        } else if raw < minMemoryGB {
+                ram, minMemoryGBFor(profile)))
+        } else if raw < minMemoryGBFor(profile) {
             notes.append(String(
                 format: "only %.1f GB of %.0f GB RAM is reclaimable right now — running at the %.1f GB floor anyway; expect heavy paging until other apps release memory",
-                avail ?? 0, ram, minMemoryGB))
+                avail ?? 0, ram, minMemoryGBFor(profile)))
         } else if clamped {
             notes.append(String(
                 format: "only %.1f GB of %.0f GB RAM is reclaimable right now (other apps hold the rest) — sized down from the usual %.1f GB; close apps and restart for full speed, or force a size with --memory-gb",
                 avail ?? 0, ram, ceiling))
         } else if ceiling >= kneeGB,
-            min((pct / 100) * ram, ws - 2.0) > 1.25 * kneeGB
+            min((pct / 100) * ram, ws - 2.0) > 1.25 * kneeGB, profile.kind == .qwen
         {
             // This machine could hold more and auto declined. Say so, or it
-            // reads as slotstream failing to use the hardware.
+            // reads as slotstream failing to use the hardware. The "stops
+            // improving" claim is a Qwen measurement; DS4 has no measured
+            // knee yet, so its plans stay quiet rather than quote it.
             notes.append(String(
                 format: "this machine could hold more, but decode stops improving around here (measured 11.2 tok/s at 120 experts/layer, 11.6 at 150) — auto caps at %.1f GB rather than spend RAM for nothing; --memory-gb N to go further",
                 usefulCeilingGB))
         }
-        let slots = slotsForTarget(target - (mtpOn ? mtpResidentGB : 0) - contextCharge)
+        let slots = slotsForTarget(target - (mtpOn ? mtpResidentGB : 0) - contextCharge, profile: profile)
         return finish(.auto, slots, target: target, mtpOn: mtpOn)
     }
 }

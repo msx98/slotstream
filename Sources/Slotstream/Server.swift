@@ -379,18 +379,34 @@ public final class Server {
                     status: "400 Bad Request", cors: cors)
                 return
             }
+            let modelfile = engine.model.isQwen
+                ? "# slotstream: SSD-streamed qwen4_exp"
+                : "# slotstream: SSD-streamed deepseek4 (GGUF)"
+            var modelInfo: [String: Any] = [
+                "general.architecture": engine.model.architecture,
+            ]
+            switch engine.model {
+            case .qwen:
+                modelInfo["general.parameter_count"] = 176_000_000_000
+            case .ds4:
+                // Expose what the GGUF header actually carries; never a
+                // computed or invented parameter count.
+                if let size = engine.ds4Info?.sizeLabel {
+                    modelInfo["general.size_label"] = size
+                }
+                if let rev = engine.ds4Info?.sourceRevision {
+                    modelInfo["general.source.revision"] = rev
+                }
+            }
             respondJSON(
                 fd,
                 [
-                    "modelfile": "# slotstream: SSD-streamed qwen4_exp",
+                    "modelfile": modelfile,
                     "parameters": "",
                     "capabilities": ["completion"],
                     "template": "{{ .Prompt }}",
                     "details": modelDetails(live: true),
-                    "model_info": [
-                        "general.architecture": "qwen4_exp",
-                        "general.parameter_count": 176_000_000_000,
-                    ],
+                    "model_info": modelInfo,
                 ], cors: cors)
         case ("POST", "/api/chat"):
             apiChat(fd, json, cors: cors)
@@ -454,12 +470,29 @@ public final class Server {
     /// there. /api/show is the endpoint that reports runtime state.
     private func modelDetails(live: Bool = false) -> [String: Any] {
         let pool = engine.poolSnapshot()
-        var d: [String: Any] = [
-            "format": "safetensors", "family": "qwen4_exp",
-            "parameter_size": "176B-A6B", "quantization_level": "4bit",
-            "expert_cache_per_layer": Int(pool.slotsPerLayer.rounded()),
-            "experts_per_layer": engine.model.cfg.numExperts,
-        ]
+        let base: [String: Any]
+        switch engine.model {
+        case .ds4:
+            var d: [String: Any] = [
+                "format": "gguf", "family": "deepseek4",
+                // general.size_label from the GGUF header ("256x8.4B" on the
+                // reference file). Omitted when the file does not carry it —
+                // never invented.
+                "quantization_level": "mxfp4",
+                "expert_cache_per_layer": Int(pool.slotsPerLayer.rounded()),
+                "experts_per_layer": engine.model.expertsPerLayer,
+            ]
+            if let size = engine.ds4Info?.sizeLabel { d["parameter_size"] = size }
+            base = d
+        case .qwen:
+            base = [
+                "format": "safetensors", "family": "qwen4_exp",
+                "parameter_size": "176B-A6B", "quantization_level": "4bit",
+                "expert_cache_per_layer": Int(pool.slotsPerLayer.rounded()),
+                "experts_per_layer": engine.model.expertsPerLayer,
+            ]
+        }
+        var d = base
         if let plan = engine.currentPlan { d["memory_plan"] = plan.json() }
         if live { d["prefix_cache"] = engine.prefixCache.json() }
         return d
@@ -469,8 +502,7 @@ public final class Server {
         var c: [String: Any] = [
             "name": engine.modelName, "model": engine.modelName,
             "modified_at": iso(Date()), "size": weightsBytes,
-            "digest": "slotstream-qwen38-flash-next-4bit",
-            "details": modelDetails(),
+            "digest": digest, "details": modelDetails(),
         ]
         if loaded {
             // Ollama reads these as "what this model costs right now" and
@@ -484,6 +516,20 @@ public final class Server {
             c["expires_at"] = iso(Date().addingTimeInterval(3600))
         }
         return c
+    }
+
+    /// The stable digest /api/tags reports. The Qwen one is the shipped
+    /// string; DS4 pins the GGUF source revision it was read from, when the
+    /// file carries it.
+    private var digest: String {
+        switch engine.model {
+        case .qwen: return "slotstream-qwen38-flash-next-4bit"
+        case .ds4:
+            if let rev = engine.ds4Info?.sourceRevision {
+                return "deepseek4-gguf@\(String(rev.prefix(12)))"
+            }
+            return "deepseek-v4-flash-gguf"
+        }
     }
 
     private func iso(_ d: Date) -> String {
@@ -628,10 +674,19 @@ public final class Server {
         guard !requested.isEmpty else { return "model must not be empty" }
         // Ollama clients routinely drop the tag or ask for ":latest". Both name
         // the only model here, and a name is not a semantic knob.
-        let accepted = [
-            engine.modelName, "qwen3.8-flash-next:4bit", "qwen38-flash-next-mlx-4bit",
-            "qwen3.8-flash-next", "qwen3.8-flash-next:latest",
-        ]
+        let accepted: [String]
+        switch engine.model {
+        case .ds4:
+            accepted = [
+                engine.modelName, "deepseek-v4-flash:gguf",
+                "deepseek-v4-flash", "deepseek-v4-flash:latest",
+            ]
+        case .qwen:
+            accepted = [
+                engine.modelName, "qwen3.8-flash-next:4bit", "qwen38-flash-next-mlx-4bit",
+                "qwen3.8-flash-next", "qwen3.8-flash-next:latest",
+            ]
+        }
         return accepted.contains(requested)
             ? nil : "model '\(requested)' is not loaded; this server has only '\(engine.modelName)'"
     }

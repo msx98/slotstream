@@ -113,7 +113,7 @@ extension Planner {
     /// supplied by accident.
     public static func plan(
         _ request: PlanRequest, on device: Machine, mtpAvailable: Bool = false,
-        visionAvailable: Bool = false
+        visionAvailable: Bool = false, profile: GeometryProfile = .qwen
     ) throws -> MemoryPlan {
         try plan(
             expertsPerLayer: request.expertsPerLayer, poolGB: request.poolGB,
@@ -121,6 +121,7 @@ extension Planner {
             workingSetGB: device.workingSetGB, availableGB: device.availableGB,
             ramPercent: request.maxRAMPercent, mtp: request.mtp, mtpAvailable: mtpAvailable,
             vision: request.vision, visionAvailable: visionAvailable,
-            maxContextTokens: request.maxContextTokens, simulated: device.isSimulated)
+            maxContextTokens: request.maxContextTokens, simulated: device.isSimulated,
+            profile: profile)
     }
 }

@@ -44,6 +44,9 @@ public enum GovernorPolicy {
         public var workingSetGB: Double
         /// The RAM share auto may target; mirrors --max-ram-percent.
         public var ramPercent: Double
+        /// The model geometry the pool is sized in (record bytes, floor, cap).
+        /// Qwen everywhere the governor predates profiles.
+        public var profile: GeometryProfile
         /// nil = no such event yet in this process.
         public var secondsSincePressure: Double?
         public var secondsSinceResize: Double?
@@ -53,10 +56,12 @@ public enum GovernorPolicy {
         public init(
             currentSlots: Int, availableGB: Double, ramGB: Double, workingSetGB: Double,
             ramPercent: Double = Planner.defaultRAMPercent,
+            profile: GeometryProfile = .qwen,
             secondsSincePressure: Double? = nil, secondsSinceResize: Double? = nil,
             pressure: Pressure? = nil
         ) {
             self.ramPercent = ramPercent
+            self.profile = profile
             self.currentSlots = currentSlots
             self.availableGB = availableGB
             self.ramGB = ramGB
@@ -76,8 +81,10 @@ public enum GovernorPolicy {
     static let shrinkDeadbandGB = 1.0
     static let growDeadbandGB = 2.0
 
-    private static func settle(_ target: Int, _ current: Int, _ reason: String) -> Decision {
-        let t = max(Geometry.floorSlots, min(target, Geometry.totalRecords))
+    private static func settle(
+        _ target: Int, _ current: Int, _ reason: String, _ profile: GeometryProfile
+    ) -> Decision {
+        let t = max(profile.floorSlots, min(target, profile.totalRecords))
         return t == current ? .hold : .resize(slots: t, reason: reason)
     }
 
@@ -87,11 +94,11 @@ public enum GovernorPolicy {
     /// footprint again when deriving slots, so without this credit the steady
     /// state under contention double-reserves ~4 GB).
     public static func desiredPlan(_ i: Inputs) -> MemoryPlan? {
-        let credited = i.availableGB + Geometry.gb(i.currentSlots) + Planner.fixedFootprintGB
+        let credited = i.availableGB + i.profile.gb(i.currentSlots) + i.profile.fixedFootprintGB
         return try? Planner.plan(
             expertsPerLayer: nil, poolGB: nil, memoryGB: nil,
             ramGB: i.ramGB, workingSetGB: i.workingSetGB, availableGB: credited,
-            ramPercent: i.ramPercent)
+            ramPercent: i.ramPercent, profile: i.profile)
     }
 
     public static func desiredSlots(_ i: Inputs) -> Int? {
@@ -111,33 +118,33 @@ public enum GovernorPolicy {
         if let p = desiredPlan(i), p.slots == targetSlots {
             return (p.prefillChunk, p.prefixCacheTokens)
         }
-        let gb = Geometry.gb(targetSlots)
+        let gb = i.profile.gb(targetSlots)
         return (
-            Planner.prefillChunkFor(poolBudgetGB: gb),
-            Planner.prefixCacheTokensFor(poolBudgetGB: gb))
+            Planner.prefillChunkFor(poolBudgetGB: gb, profile: i.profile),
+            Planner.prefixCacheTokensFor(poolBudgetGB: gb, profile: i.profile))
     }
 
     public static func decide(_ i: Inputs) -> Decision {
-        let curGB = Geometry.gb(i.currentSlots)
+        let curGB = i.profile.gb(i.currentSlots)
         let desired = desiredSlots(i)
         // OS pressure events see what availability math cannot: compressor and
         // swap strain from system-wide overcommit. Shed an absolute chunk —
         // repeated events keep shedding until the pressure stops.
         if let p = i.pressure {
             let shedGB = p == .critical ? max(4.0, curGB * 0.5) : max(2.0, curGB * 0.15)
-            var target = Int((curGB - shedGB) * 1e9 / Geometry.recordBytes)
+            var target = Int((curGB - shedGB) * 1e9 / i.profile.recordBytes)
             if let d = desired { target = min(target, d) }
-            return settle(target, i.currentSlots, "memory pressure (\(p.rawValue))")
+            return settle(target, i.currentSlots, "memory pressure (\(p.rawValue))", i.profile)
         }
         guard let d = desired else { return .hold }
-        let desiredGB = Geometry.gb(d)
+        let desiredGB = i.profile.gb(d)
         if desiredGB <= curGB - shrinkDeadbandGB {
-            return settle(d, i.currentSlots, "availability dropped")
+            return settle(d, i.currentSlots, "availability dropped", i.profile)
         }
         if desiredGB >= curGB + growDeadbandGB {
             let calm = i.secondsSincePressure.map { $0 > growCooldown } ?? true
             let cooled = i.secondsSinceResize.map { $0 > growCooldown } ?? true
-            if calm, cooled { return settle(d, i.currentSlots, "memory freed") }
+            if calm, cooled { return settle(d, i.currentSlots, "memory freed", i.profile) }
         }
         return .hold
     }
@@ -210,6 +217,7 @@ public final class MemoryGovernor {
             ramGB: cur.ramGB,
             workingSetGB: cur.workingSetGB,
             ramPercent: cur.ramPercent,
+            profile: cur.profile,
             secondsSincePressure: lastPressureAt.map { now.timeIntervalSince($0) },
             secondsSinceResize: lastResizeAt.map { now.timeIntervalSince($0) },
             pressure: pressure)
@@ -284,13 +292,14 @@ public final class MemoryGovernor {
                 mtpEnabled: ref?.mtpEnabled ?? false,
                 notes: [String(
                     format: "elastic: resized ~%.0f → ~%.0f experts/layer (%@)",
-                    Geometry.perLayer(before), Geometry.perLayer(after), reason)]))
+                    engine.profile.perLayer(before), engine.profile.perLayer(after), reason)],
+                profile: engine.profile))
         }
         lastResizeAt = Date()
         log(String(
             format: "%@ — cache ~%.0f → ~%.0f experts/layer (%.1f → %.1f GB pool%@)",
-            reason, Geometry.perLayer(before), Geometry.perLayer(after),
-            Geometry.gb(before), Geometry.gb(after),
+            reason, engine.profile.perLayer(before), engine.profile.perLayer(after),
+            engine.profile.gb(before), engine.profile.gb(after),
             growing ? ", contents kept" : ", cold — refills from SSD"))
     }
 

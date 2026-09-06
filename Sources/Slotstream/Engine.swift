@@ -80,9 +80,97 @@ public struct ChatMessage {
     }
 }
 
+/// The one model an Engine runs.
+///
+/// **Design note — why an enum box and not a protocol.** The alternative was a
+/// protocol with associated types (model/state), which would have put
+/// existentials on the generate hot path or forced a huge generic rewrite of
+/// Generator and PrefixCache. The enum keeps every hot path concrete: the
+/// Qwen branch of `Generator.generate` still runs against the concrete
+/// `Qwen4ExpModel` (bound once, then a local), and the DS4 branch runs
+/// against the concrete `DS4Model`. State never crosses this seam in this
+/// cut — DS4 has no prefix cache, no disk tier, and no MTP (see the scope
+/// notes in `Engine.init`), so no matching state box exists; when DS4 gains a
+/// prefix cache, that is the moment an `EngineState` box earns its place.
+public enum EngineModel {
+    case qwen(Qwen4ExpModel)
+    case ds4(DS4Model)
+
+    /// The shared expert pool (both models stream experts through one).
+    public var pool: SlotPool {
+        switch self {
+        case .qwen(let m): return m.pool
+        case .ds4(let m): return m.pool
+        }
+    }
+
+    /// Routed experts per layer, for the startup banner and /api/show.
+    public var expertsPerLayer: Int {
+        switch self {
+        case .qwen(let m): return m.cfg.numExperts
+        case .ds4(let m): return m.cfg.expertCount
+        }
+    }
+
+    /// The architecture string /api/show reports.
+    public var architecture: String {
+        switch self {
+        case .qwen: return "qwen4_exp"
+        case .ds4: return "deepseek4"
+        }
+    }
+
+    public var hasMTPDraftHead: Bool {
+        if case .qwen(let m) = self { return m.mtpHead != nil }
+        return false
+    }
+
+    public var isQwen: Bool {
+        if case .qwen = self { return true }
+        return false
+    }
+
+    /// The concrete Qwen model. The parity/inspection commands are Qwen-only
+    /// tools and use this directly; a DS4 engine makes the misuse loud
+    /// instead of quietly returning wrong-shaped state.
+    public var qwenModel: Qwen4ExpModel {
+        guard case .qwen(let m) = self else {
+            fatalError("this command needs the Qwen model; the loaded engine is a DS4 (deepseek4) engine")
+        }
+        return m
+    }
+
+    public var qwen: Qwen4ExpModel? {
+        if case .qwen(let m) = self { return m }
+        return nil
+    }
+
+    public var ds4: DS4Model? {
+        if case .ds4(let m) = self { return m }
+        return nil
+    }
+}
+
+/// What /api/show says about a DS4 GGUF beyond its geometry, read once from
+/// the header at boot. nil on a Qwen engine.
+public struct DS4ModelInfo: Sendable {
+    public let name: String?
+    public let sizeLabel: String?
+    public let sourceRevision: String?
+    public let sourceURL: String?
+    /// The deepseek4 text-model GGUF this engine runs from.
+    public let ggufPath: String
+}
+
 public final class Engine {
     public let modelDir: URL
-    public let model: Qwen4ExpModel
+    /// The loaded model: `.qwen` for the pinned Qwen4Exp checkpoint, `.ds4`
+    /// for a directory whose GGUF declares `general.architecture == deepseek4`.
+    public let model: EngineModel
+    /// The model geometry the memory plan and the pool speak in.
+    public let profile: GeometryProfile
+    /// DS4 header metadata for /api/show; nil on a Qwen engine.
+    public let ds4Info: DS4ModelInfo?
     public let generator: Generator
     public let tokenizer: any Tokenizers.Tokenizer
     public let eosIds: Set<Int>
@@ -117,7 +205,8 @@ public final class Engine {
                     clamped: p.clamped, prefillChunk: p.prefillChunk,
                     prefixCacheTokens: capped, mtpEnabled: p.mtpEnabled,
                     visionEnabled: p.visionEnabled,
-                    maxContextTokens: maxContextTokens, notes: p.notes))
+                    maxContextTokens: maxContextTokens, notes: p.notes,
+                    simulated: p.simulated, profile: p.profile))
             }
         }
     }
@@ -140,12 +229,15 @@ public final class Engine {
     public func contextError(promptTokens: Int) -> String? {
         guard promptTokens > maxContextTokens else { return nil }
         let wait = PrefillSchedule.describe(seconds: PrefillSchedule.estSeconds(
-            tokens: promptTokens, maxChunk: generator.prefillChunk))
+            tokens: promptTokens, maxChunk: generator.prefillChunk, profile: profile))
         let ceiling = maxContextTokens < ContextPolicy.maxTokens
             ? "this server was started with --max-context \(maxContextTokens); "
                 + "the ceiling is \(ContextPolicy.maxTokens)"
             : "\(ContextPolicy.maxTokens) is the largest context slotstream has measured, "
-                + "not a memory limit (context state costs ~27 KiB per token)"
+                + "not a memory limit (context state costs ~"
+                + String(
+                    format: "%.0f KiB per token)",
+                    Double(profile.contextBytesPerToken) / 1024)
         return "prompt is \(promptTokens) tokens, over this server's limit of "
             + "\(maxContextTokens) for prompt plus reply. \(ceiling). Reading a prompt "
             + "this long would take ~\(wait) before the first token here. Send less, or "
@@ -214,58 +306,232 @@ public final class Engine {
         if plan?.simulated == true { throw SlotstreamError.simulatedDeviceCannotLoad }
         self.modelDir = modelDir
         self._plan = plan
+        // Model dispatch: a directory whose GGUF declares the deepseek4
+        // architecture builds the DS4 path (config → weights → expert store →
+        // pool, all from the GGUF); everything else is the pinned Qwen
+        // checkpoint exactly as before. Sidecar GGUFs in the same directory
+        // (the vision encoder, the DSpark head) declare other architectures
+        // and are tolerated; more than one deepseek4 text model is an error.
+        let ds4URL = try Self.ds4GGUF(in: modelDir)
+        self.profile = ds4URL != nil ? .ds4 : .qwen
         // Sized from the same budget as the pool; SLOTSTREAM_PREFIX_CACHE=0
         // (or --no-prefix-cache) pins it off for parity work.
+        //
+        // DS4 first cut: the conversation prefix cache is NOT built for DS4.
+        // PrefixCache holds `Qwen4ExpModel.State`, and a DS4 state box does
+        // not exist yet; wiring DS4State in without a prefix-check
+        // equivalent would trade a measured invariant for an unmeasured one.
+        // The cache is therefore constructed disabled and `generate` hands
+        // the generator nil, so no DS4 state is ever stored or reused.
+        // Follow-up: an EngineState box + a DS4 prefix-check gate.
         let env = ProcessInfo.processInfo.environment["SLOTSTREAM_PREFIX_CACHE"]
-        self.prefixCache = PrefixCache(
-            maxTokens: plan?.prefixCacheTokens
-                ?? Planner.prefixCacheTokensFor(poolBudgetGB: Geometry.gb(poolSlots)),
-            enabled: env != "0")
+        switch profile.kind {
+        case .ds4:
+            self.prefixCache = PrefixCache(maxTokens: 0, enabled: false)
+        case .qwen:
+            self.prefixCache = PrefixCache(
+                maxTokens: plan?.prefixCacheTokens
+                    ?? Planner.prefixCacheTokensFor(
+                        poolBudgetGB: Geometry.gb(poolSlots)),
+                enabled: env != "0")
+        }
         // MLX's allocator otherwise retains freed transients (KV caches,
         // activations) in an unbounded internal cache — measured ~5 GB of RSS
         // above the memory plan after a few dozen requests. 2 GB keeps
         // per-token reallocation churn away while making real process memory
         // track the announced plan.
         MLX.Memory.cacheLimit = 2 << 30
-        self.modelName = "qwen3.8-flash-next:4bit"
         let t0 = Date()
-        let index = try CheckpointIndex(dir: modelDir)
-        self.model = try Qwen4ExpModel(index: index, poolSlots: poolSlots)
-        try model.validate()
-        // Read from the index that is already open — no tensor is touched, and
-        // nothing is allocated until an image actually arrives.
-        self.visionAvailable = VisionTower.present(index: index)
-        self.visionAllowed = plan?.visionEnabled ?? visionAvailable
-        if plan?.mtpEnabled == true {
-            try model.enableMTP(modelDir: modelDir)
+        if let ggufURL = ds4URL {
+            // ---- DS4 (DeepSeek-V4-Flash from GGUF)
+            self.modelName = "deepseek-v4-flash:gguf"
+            let boot = try Self.bootDS4(modelDir: modelDir, ggufPath: ggufURL.path, poolSlots: poolSlots)
+            self.model = .ds4(boot.model)
+            self.ds4Info = boot.info
+            // MTP/speculation is not built for DS4 in this cut. auto never
+            // gets here (the GGUF dir has no mtp.safetensors), so this only
+            // fires for an explicit --mtp on, which is refused rather than
+            // silently ignored.
+            if plan?.mtpEnabled == true {
+                throw PlanError(
+                    "--mtp is not supported for deepseek-v4-flash:gguf — no draft head is "
+                        + "built for this architecture yet; use --mtp off/auto")
+            }
+            self.generator = Generator(model: self.model)
+            if let p = plan, ProcessInfo.processInfo.environment["SLOTSTREAM_PREFILL_CHUNK"] == nil {
+                generator.prefillChunk = p.prefillChunk
+            }
+            if let mb = Int(ProcessInfo.processInfo.environment["SLOTSTREAM_PREFILL_CACHE_MB"] ?? "") {
+                generator.prefillCacheLimit = max(0, mb) << 20
+            } else if let p = plan, p.expectedPeakGB <= 12 {
+                generator.prefillCacheLimit = 512 << 20
+            }
+            self.tokenizer = try await AutoTokenizer.from(
+                modelFolder: URL(fileURLWithPath: boot.tokenizerDir))
+            var eos: Set<Int> = []
+            if let e = boot.gguf.kv("tokenizer.ggml.eos_token_id")?.intValue { eos.insert(e) }
+            if let e = tokenizer.eosTokenId { eos.insert(e) }
+            self.eosIds = eos
+            // The vision sidecar is not supported in this cut: the variant is
+            // named vision-exp and the encoder is a separate GGUF this engine
+            // does not load, so an image request must be refused clearly
+            // rather than answered wrong.
+            self.visionAvailable = false
+            self.visionAllowed = false
+        } else {
+            // ---- Qwen (the pinned checkpoint; this path is unchanged)
+            self.modelName = "qwen3.8-flash-next:4bit"
+            self.ds4Info = nil
+            let index = try CheckpointIndex(dir: modelDir)
+            let qwen = try Qwen4ExpModel(index: index, poolSlots: poolSlots)
+            self.model = .qwen(qwen)
+            try qwen.validate()
+            // Read from the index that is already open — no tensor is touched, and
+            // nothing is allocated until an image actually arrives.
+            self.visionAvailable = VisionTower.present(index: index)
+            self.visionAllowed = plan?.visionEnabled ?? visionAvailable
+            if plan?.mtpEnabled == true {
+                try qwen.enableMTP(modelDir: modelDir)
+            }
+            self.generator = Generator(model: self.model)
+            if let p = plan, ProcessInfo.processInfo.environment["SLOTSTREAM_PREFILL_CHUNK"] == nil {
+                generator.prefillChunk = p.prefillChunk
+            }
+            if let mb = Int(ProcessInfo.processInfo.environment["SLOTSTREAM_PREFILL_CACHE_MB"] ?? "") {
+                generator.prefillCacheLimit = max(0, mb) << 20
+            } else if let p = plan, p.expectedPeakGB <= 12 {
+                generator.prefillCacheLimit = 512 << 20
+            }
+            self.tokenizer = try await AutoTokenizer.from(modelFolder: modelDir)
+            var eos: Set<Int> = [index.config.eosTokenId]
+            if let e = tokenizer.eosTokenId { eos.insert(e) }
+            // generation_config may list several
+            if let d = try? Data(contentsOf: modelDir.appendingPathComponent("generation_config.json")),
+                let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any]
+            {
+                if let list = o["eos_token_id"] as? [Int] { list.forEach { eos.insert($0) } }
+                if let one = o["eos_token_id"] as? Int { eos.insert(one) }
+            }
+            self.eosIds = eos
         }
-        self.generator = Generator(model: model)
-        if let p = plan, ProcessInfo.processInfo.environment["SLOTSTREAM_PREFILL_CHUNK"] == nil {
-            generator.prefillChunk = p.prefillChunk
-        }
-        if let mb = Int(ProcessInfo.processInfo.environment["SLOTSTREAM_PREFILL_CACHE_MB"] ?? "") {
-            generator.prefillCacheLimit = max(0, mb) << 20
-        } else if let p = plan, p.expectedPeakGB <= 12 {
-            generator.prefillCacheLimit = 512 << 20
-        }
-        self.tokenizer = try await AutoTokenizer.from(modelFolder: modelDir)
-        var eos: Set<Int> = [index.config.eosTokenId]
-        if let e = tokenizer.eosTokenId { eos.insert(e) }
-        // generation_config may list several
-        if let d = try? Data(contentsOf: modelDir.appendingPathComponent("generation_config.json")),
-            let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any]
-        {
-            if let list = o["eos_token_id"] as? [Int] { list.forEach { eos.insert($0) } }
-            if let one = o["eos_token_id"] as? Int { eos.insert(one) }
-        }
-        self.eosIds = eos
         publishPoolSnapshot()
         let banner = "engine ready in \(String(format: "%.1f", -t0.timeIntervalSinceNow))s: "
-            + "expert cache ~\(String(format: "%.0f", model.pool.slotsPerLayer))/\(model.cfg.numExperts) per layer "
+            + "expert cache ~\(String(format: "%.0f", model.pool.slotsPerLayer))/\(model.expertsPerLayer) per layer "
             + "(\(model.pool.slots) global slots = \(String(format: "%.1f", Double(model.pool.poolBytes) / 1e9)) GB), "
-            + (model.mtpHead != nil ? "mtp draft head on, " : "")
-            + "eos \(eos.sorted())\n"
+            + (model.hasMTPDraftHead ? "mtp draft head on, " : "")
+            + "eos \(eosIds.sorted())\n"
         FileHandle.standardError.write(banner.data(using: .utf8)!)
+    }
+
+    // MARK: model dispatch helpers
+
+    /// The deepseek4 text-model GGUF in `dir`, if any. Sidecars (vision
+    /// encoder, DSpark head) declare other `general.architecture` values and
+    /// are skipped; two deepseek4 GGUFs in one directory is an error because
+    /// "pick one" would be a guess.
+    public static func ds4GGUF(in dir: URL) throws -> URL? {
+        let fm = FileManager.default
+        let entries: [URL]
+        do {
+            entries = try fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)
+        } catch {
+            // Not a listable directory: nothing to find here. The Qwen path
+            // produces the "no model at ..." error the caller expects.
+            return nil
+        }
+        var matches: [URL] = []
+        for e in entries where e.pathExtension.lowercased() == "gguf" {
+            guard let gguf = try? GGUFFile(path: e.path),
+                gguf.kv("general.architecture")?.stringValue == DS4Config.prefix
+            else { continue }
+            matches.append(e)
+        }
+        switch matches.count {
+        case 0: return nil
+        case 1: return matches[0]
+        default:
+            throw ModelError(
+                "\(dir.path) holds \(matches.count) deepseek4 GGUF files — pass a directory "
+                    + "with exactly one text model: "
+                    + matches.map { ($0 as NSURL).lastPathComponent ?? $0.path }.joined(separator: ", "))
+        }
+    }
+
+    /// Everything the DS4 boot needs, built without touching `self` (the init
+    /// is async and must not read partially initialized state).
+    private struct DS4Boot {
+        let model: DS4Model
+        let info: DS4ModelInfo
+        let tokenizerDir: String
+        let gguf: GGUFFile
+    }
+
+    private static func bootDS4(modelDir: URL, ggufPath: String, poolSlots: Int) throws -> DS4Boot {
+        let total = GeometryProfile.ds4.totalRecords
+        guard poolSlots >= 1, poolSlots <= total else {
+            throw ModelError(
+                "expert-pool slot count must be between 1 and \(total), got \(poolSlots)")
+        }
+        // Header + metadata only; tensor bytes are read by the loaders below.
+        let gguf = try GGUFFile(path: ggufPath)
+        // The Geometry.check analog: DS4Config.init validates the exact Flash
+        // geometry (and, with the gguf argument, the tensor directory) and
+        // rejects anything else with a --model-style message.
+        let cfg = try DS4Config(gguf: gguf)
+        let weights = try DS4Weights(ggufPath: ggufPath, cfg: cfg)
+        let experts = try DS4ExpertStore(ggufPath: ggufPath, cfg: cfg)
+        let pool = SlotPool(slots: poolSlots, source: .ds4(experts))
+        let model = try DS4Model(cfg: cfg, weights: weights, experts: experts, pool: pool)
+        let info = DS4ModelInfo(
+            name: gguf.kv("general.name")?.stringValue,
+            sizeLabel: gguf.kv("general.size_label")?.stringValue,
+            sourceRevision: gguf.kv("general.source.revision")?.stringValue,
+            sourceURL: gguf.kv("general.source.url")?.stringValue,
+            ggufPath: ggufPath)
+        let tokenizerDir = try ensureDS4Tokenizer(modelDir: modelDir, gguf: gguf, cfg: cfg)
+        return DS4Boot(model: model, info: info, tokenizerDir: tokenizerDir, gguf: gguf)
+    }
+
+    /// The folder swift-transformers loads the DS4 tokenizer from.
+    ///
+    /// swift-transformers needs a folder of HF files, and the weights live in
+    /// a GGUF (and may sit on a read-only volume), so the tokenizer is
+    /// exported from the GGUF metadata into `~/.slotstream/ds4/<dir>/`. A
+    /// previous export is reused only when all three files exist and the
+    /// exported vocabulary still matches the GGUF's token count — the cheap
+    /// validity check that keeps a stale or partial export from serving.
+    private static func ensureDS4Tokenizer(modelDir: URL, gguf: GGUFFile, cfg: DS4Config) throws
+        -> String
+    {
+        let home = ModelLocator.home
+        let safe = modelDir.lastPathComponent.map {
+            $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" || $0 == "." ? $0 : "_"
+        }
+        let dir = home.appendingPathComponent(".slotstream/ds4/\(String(safe))/tokenizer")
+        let path = dir.path
+        let fm = FileManager.default
+        let files = ["tokenizer.json", "tokenizer_config.json", "chat_template.jinja"]
+        var reusable = files.allSatisfy {
+            ((try? fm.attributesOfItem(atPath: path + "/" + $0))?[.size] as? Int ?? 0) > 0
+        }
+        if reusable {
+            // The vocab-count check: parse tokenizer.json and compare its
+            // vocab size with the GGUF. A mismatched export would tokenize
+            // prompts into ids the model cannot read.
+            if let data = fm.contents(atPath: path + "/tokenizer.json"),
+                let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                let model = obj["model"] as? [String: Any],
+                let vocab = model["vocab"] as? [String: Any]
+            {
+                reusable = vocab.count == cfg.vocabSize
+            } else {
+                reusable = false
+            }
+        }
+        if !reusable {
+            try exportTokenizer(from: gguf, to: path)
+        }
+        return path
     }
 
     public func encodeChat(_ messages: [ChatMessage], thinking: Bool) throws -> [Int] {
@@ -321,7 +587,10 @@ public final class Engine {
         _ messages: [ChatMessage], tools: [ToolDefinition], thinking: Bool, effort: String?
     ) throws -> [Int] {
         let full = try encodeChat(messages, tools: tools, thinking: thinking, effort: effort)
-        guard prefixCache.enabled, messages.contains(where: { $0.role == "assistant" })
+        // The splice replays ids the prefix cache held, which only exists for
+        // Qwen in this cut (see Engine.init); DS4 takes the plain render.
+        guard case .qwen = model, prefixCache.enabled,
+            messages.contains(where: { $0.role == "assistant" })
         else { return full }
         let fullText = tokenizer.decode(tokens: full, skipSpecialTokens: false)
 
@@ -411,7 +680,19 @@ public final class Engine {
         modelDir: URL, messages: [ChatMessage], thinking: Bool,
         tools: [ToolDefinition] = [], effort: String? = nil
     ) async throws -> [Int] {
-        let tokenizer = try await AutoTokenizer.from(modelFolder: modelDir)
+        // A DS4 directory keeps its tokenizer inside a GGUF, so the same
+        // export-or-reuse path the engine boot uses points the loader at the
+        // exported folder.
+        let folder: URL
+        if let gguf = try ds4GGUF(in: modelDir) {
+            let ggufFile = try GGUFFile(path: gguf.path)
+            let cfg = try DS4Config(gguf: ggufFile)
+            folder = URL(fileURLWithPath: try ensureDS4Tokenizer(
+                modelDir: modelDir, gguf: ggufFile, cfg: cfg))
+        } else {
+            folder = modelDir
+        }
+        let tokenizer = try await AutoTokenizer.from(modelFolder: folder)
         return try tokenizer.applyChatTemplate(
             messages: messages.map { $0.templateValue },
             tools: tools.isEmpty ? nil : tools.map { $0.templateValue },
@@ -477,6 +758,14 @@ public final class Engine {
     /// refusal it can act on instead of a gigabyte of swap.
     public func ensureVisionTower() throws -> VisionTower {
         if let vt = visionTower { return vt }
+        // The DS4 variant is "vision-exp" and ships its tower as a separate
+        // GGUF this engine does not load. Refuse with that sentence rather
+        // than the generic --vision-off one, so nobody goes hunting a flag.
+        guard case .qwen = model else {
+            throw SlotstreamError.vision(
+                "deepseek-v4-flash:gguf is text-only in this build — the vision sidecar GGUF "
+                    + "is not supported; send text only")
+        }
         guard visionAllowed else {
             throw SlotstreamError.vision(
                 "this server was started with --vision off; images are not accepted")
@@ -562,7 +851,12 @@ public final class Engine {
         // that length is what makes the two line up, and it moves every token
         // after the first image — ids and segment offsets alike, in one sweep,
         // so a later prompt that extends this one keys identically.
-        let imageId = model.cfg.imageTokenId
+        // Unreachable for DS4 — ensureVisionTower threw above — but the
+        // image-token config only exists on Qwen, so the shape says so.
+        guard let qcfg = model.qwen?.cfg else {
+            throw SlotstreamError.vision("vision is not supported by this model")
+        }
+        let imageId = qcfg.imageTokenId
         let perImage = items.map { $0.plan.mergedTokens }
         var expanded: [Int] = []
         var segments: [ImageSegment] = []
@@ -600,7 +894,7 @@ public final class Engine {
         return (
             expanded,
             VisionPrompt(
-                tower: vt, items: items, segments: segments, hiddenSize: model.cfg.hiddenSize)
+                tower: vt, items: items, segments: segments, hiddenSize: qcfg.hiddenSize)
         )
     }
 
@@ -739,8 +1033,12 @@ public final class Engine {
             return ok
         } : nil
 
+        // No prefix cache for DS4 in this cut (see Engine.init): the cache
+        // would never hold a DS4State, so the generator is handed nil rather
+        // than a cache it could only ever miss on.
         let (ids, stats) = generator.generate(
-            promptIds: promptIds, params: params, eosIds: eosIds, cache: prefixCache,
+            promptIds: promptIds, params: params, eosIds: eosIds,
+            cache: model.isQwen ? prefixCache : nil,
             vision: vision,
             shouldContinue: {
                 guard !clientGone, !stopFound else { return false }

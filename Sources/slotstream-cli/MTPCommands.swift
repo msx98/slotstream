@@ -113,13 +113,13 @@ struct MTPAccept: ParsableCommand {
         Task {
             do {
                 let engine = try await Engine(modelDir: model.modelURL, plan: plan)
-                try engine.model.enableMTP(modelDir: model.modelURL)
+                try engine.model.qwenModel.enableMTP(modelDir: model.modelURL)
                 var traces: [GreedyTrace] = []
                 for (i, prompt) in mtpProbePrompts.enumerated() {
                     let ids = try engine.encodeChat(
                         [ChatMessage(role: "user", content: prompt)], thinking: false)
                     let t = probeGreedy(
-                        model: engine.model, promptIds: ids, eosIds: engine.eosIds,
+                        model: engine.model.qwenModel, promptIds: ids, eosIds: engine.eosIds,
                         maxTokens: maxTokens, depth: depth)
                     traces.append(t)
                     FileHandle.standardError.write(
@@ -308,7 +308,7 @@ struct MTPBench: ParsableCommand {
         Task {
             do {
                 let engine = try await Engine(modelDir: model.modelURL, plan: plan)
-                try engine.model.enableMTP(modelDir: model.modelURL)
+                try engine.model.qwenModel.enableMTP(modelDir: model.modelURL)
                 var params = sample ? SampleParams() : SampleParams.greedy
                 if sample { params.seed = seed }
                 params.maxTokens = maxTokens
@@ -381,7 +381,7 @@ struct MTPCheck: ParsableCommand {
         Task {
             do {
                 let engine = try await Engine(modelDir: model.modelURL, plan: plan)
-                try engine.model.enableMTP(modelDir: model.modelURL)
+                try engine.model.qwenModel.enableMTP(modelDir: model.modelURL)
                 var failures: [String] = []
                 func check(_ name: String, _ ok: Bool) {
                     print(ok ? "PASS  \(name)" : "FAIL  \(name)")
@@ -450,7 +450,7 @@ struct MTPCheck: ParsableCommand {
                         print(
                             "  info  vision+mtp prompt: \(ids.count) tokens, "
                                 + "\(vision.segments.count) image(s), placeholder id "
-                                + "\(engine.model.cfg.imageTokenId)")
+                                + "\(engine.model.qwenModel.cfg.imageTokenId)")
                         func genVision(_ ids: [Int], _ vision: VisionPrompt?, spec: Bool)
                             throws -> ([Int], GenStats)
                         {
@@ -504,35 +504,35 @@ struct MTPCheck: ParsableCommand {
                     let tail = Array(probe.suffix(2))
                     func vec(_ a: MLXArray) -> [Float] { a.reshaped([-1]).asType(.float32).asArray(Float.self) }
                     // plain path: prefix, then token 1 alone
-                    let stPlain = engine.model.makeState()
-                    eval(engine.model.hiddenStates(prefix, state: stPlain))
-                    eval(engine.model.hiddenStates([tail[0]], state: stPlain))
+                    let stPlain = engine.model.qwenModel.makeState()
+                    eval(engine.model.qwenModel.hiddenStates(prefix, state: stPlain))
+                    eval(engine.model.qwenModel.hiddenStates([tail[0]], state: stPlain))
                     // recording pass over both tokens from the same prefix, then rollback to token 1
-                    let st = engine.model.makeState()
-                    eval(engine.model.hiddenStates(prefix, state: st))
+                    let st = engine.model.qwenModel.makeState()
+                    eval(engine.model.qwenModel.hiddenStates(prefix, state: st))
                     let ck = st.checkpoint()
-                    let (batched, _) = engine.model.allLogitsWithMulti(tail, state: st)
+                    let (batched, _) = engine.model.qwenModel.allLogitsWithMulti(tail, state: st)
                     eval(batched)
                     st.restore(ck)
                     st.setRecording(true)
-                    let (stepped, _) = engine.model.allLogitsWithMulti(tail, state: st)
+                    let (stepped, _) = engine.model.qwenModel.allLogitsWithMulti(tail, state: st)
                     eval(stepped)
-                    st.rollback(keeping: 1, of: tail, from: ck, ngramWindow: engine.model.cfg.ngramSize - 1)
+                    st.rollback(keeping: 1, of: tail, from: ck, ngramWindow: engine.model.qwenModel.cfg.ngramSize - 1)
                     let d = st.recurrentDelta(vs: stPlain)
                     // Control for the state deltas: the plain path built the same
                     // way but with its prefix re-chunked (7 tokens at a time), the
                     // accepted "same computation, summed differently" band.
-                    let stCtrl = engine.model.makeState()
+                    let stCtrl = engine.model.qwenModel.makeState()
                     var i0 = 0
                     while i0 < prefix.count {
                         let hi = min(i0 + 7, prefix.count)
-                        eval(engine.model.hiddenStates(Array(prefix[i0 ..< hi]), state: stCtrl))
+                        eval(engine.model.qwenModel.hiddenStates(Array(prefix[i0 ..< hi]), state: stCtrl))
                         i0 = hi
                     }
-                    eval(engine.model.hiddenStates([tail[0]], state: stCtrl))
+                    eval(engine.model.qwenModel.hiddenStates([tail[0]], state: stCtrl))
                     let dc = stCtrl.recurrentDelta(vs: stPlain)
-                    let after = engine.model.lastLogits([tail[1]], state: st)
-                    let plainStep = engine.model.lastLogits([tail[1]], state: stPlain)
+                    let after = engine.model.qwenModel.lastLogits([tail[1]], state: st)
+                    let plainStep = engine.model.qwenModel.lastLogits([tail[1]], state: stPlain)
                     eval(after, plainStep)
                     let (rel, same) = PrefixCheck.compare(vec(batched), vec(stepped))
                     let (relRoll, sameRoll) = PrefixCheck.compare(vec(plainStep), vec(after))
@@ -585,7 +585,7 @@ struct MTPCheck: ParsableCommand {
                 check("turn-2 reused the speculative turn-1 state", (hit?.reused ?? 0) > 0)
                 if let hit = hit, hit.reused > 0 {
                     let rest = Array(ids2[hit.reused...])
-                    let spec = vec(engine.model.lastLogits(rest, state: hit.state))
+                    let spec = vec(engine.model.qwenModel.lastLogits(rest, state: hit.state))
                     let whole = PrefixCheck.logits(engine, ids: ids2, .whole)
                     let (ctrl, _) = PrefixCheck.compare(
                         whole, PrefixCheck.logits(engine, ids: ids2, .chunked(7)))
@@ -640,8 +640,8 @@ struct MTPPassCost: ParsableCommand {
         Task {
             do {
                 let engine = try await Engine(modelDir: model.modelURL, plan: plan)
-                try engine.model.enableMTP(modelDir: model.modelURL)
-                let m = engine.model
+                try engine.model.qwenModel.enableMTP(modelDir: model.modelURL)
+                let m = engine.model.qwenModel
                 guard let head = m.mtpHead else { throw ModelError("draft head not loaded") }
                 var params = SampleParams.greedy
                 params.maxTokens = maxTokens
