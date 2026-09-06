@@ -3,12 +3,16 @@
 # server or produced silently wrong output before 0.1.5. Each one starts from a
 # live server and asserts the process is still up afterwards.
 #
-# Usage: Tools/api_robustness.sh [port] [experts-per-layer]
+# Usage: Tools/api_robustness.sh [port] [experts-per-layer] [memory-gb]
+# The third argument is optional: verify.sh runs this with serve's own
+# auto-sized pool, but a manual run should bound it (8.1 to 10) per the
+# memory rules.
 set -u
 cd "$(dirname "$0")/.."
 BIN=.build/release/slotstream
 PORT=${1:-11466}
 EPL=${2:-13}
+MEM=${3:-}
 PASS=0; FAIL=0
 # The 24 required files; the optional draft head (1,470,955,171 bytes, pulled
 # with the weights since 0.2.2) counts when it is present, since /api/tags
@@ -21,7 +25,11 @@ say() { printf '%s\n' "$*"; }
 ok()  { say "PASS  $1"; PASS=$((PASS+1)); }
 bad() { say "FAIL  $1${2:+  ($2)}"; FAIL=$((FAIL+1)); }
 
-$BIN serve --port "$PORT" --experts-per-layer "$EPL" >/tmp/ssrob.log 2>&1 &
+if [ -n "$MEM" ]; then
+  $BIN serve --port "$PORT" --experts-per-layer "$EPL" --memory-gb "$MEM" >/tmp/ssrob.log 2>&1 &
+else
+  $BIN serve --port "$PORT" --experts-per-layer "$EPL" >/tmp/ssrob.log 2>&1 &
+fi
 SRV=$!
 trap 'kill $SRV 2>/dev/null' EXIT
 for _ in $(seq 1 90); do
@@ -291,15 +299,137 @@ for F in '"max_tokens":null' '"stop":null' '"temperature":null' '"seed":null' '"
       -d "{\"model\":\"qwen3.8-flash-next:4bit\",\"messages\":[{\"role\":\"user\",\"content\":\"Say OK\"}],\"max_tokens\":4,$F}")
   [ "$C" = 200 ] && ok "/v1 treats $F as unset" || bad "/v1 rejected $F" "$C"
 done
-for F in '"n":1' '"frequency_penalty":0' '"user":"u1"' '"logprobs":false' '"logit_bias":{}' '"tools":[]' '"response_format":{"type":"text"}'; do
+for F in '"n":1' '"frequency_penalty":0' '"user":"u1"' '"logprobs":false' '"logit_bias":{}' '"tools":[]' '"tool_choice":"none"' '"parallel_tool_calls":true' '"response_format":{"type":"text"}'; do
   C=$(curl -s -o /dev/null -w '%{http_code}' --max-time 120 -X POST "http://127.0.0.1:$PORT/v1/chat/completions" \
       -d "{\"model\":\"qwen3.8-flash-next:4bit\",\"messages\":[{\"role\":\"user\",\"content\":\"Say OK\"}],\"max_tokens\":4,$F}")
   [ "$C" = 200 ] && ok "/v1 accepts the no-op default $F" || bad "/v1 rejected the no-op default $F" "$C"
 done
-for F in '"n":2' '"frequency_penalty":0.5' '"logprobs":true' '"tools":[{"type":"function"}]' '"response_format":{"type":"json_object"}'; do
+for F in '"n":2' '"frequency_penalty":0.5' '"logprobs":true' '"parallel_tool_calls":false' '"response_format":{"type":"json_object"}'; do
   C=$(curl -s -o /dev/null -w '%{http_code}' --max-time 60 -X POST "http://127.0.0.1:$PORT/v1/chat/completions" \
       -d "{\"model\":\"qwen3.8-flash-next:4bit\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],$F}")
   [ "$C" = 400 ] && ok "/v1 still refuses the real feature $F" || bad "/v1 accepted $F" "$C"
+done
+
+# --- OpenAI tool calling -----------------------------------------------------
+# The same scenario the fx gateway gate runs (Tools/fx_scenarios.py): a
+# declared read_file tool, a call, the result fed back. Wire shapes are
+# OpenAI's: arguments as a JSON string, `role: "tool"` results, tool_calls on
+# the assistant turn, finish_reason "tool_calls".
+V1TOOL='{"type":"function","function":{"name":"read_file","description":"Read a file from the workspace.","parameters":{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer"}},"required":["path"]}}}'
+V1SYS="You are a coding agent working in the user's workspace."
+V1REQ="\"model\":\"qwen3.8-flash-next:4bit\",\"stream\":false,\"tool_choice\":\"auto\",\"max_tokens\":128,\"tools\":[$V1TOOL]"
+
+R=$(post /v1/chat/completions "{$V1REQ,\"messages\":[{\"role\":\"system\",\"content\":\"$V1SYS\"},{\"role\":\"user\",\"content\":\"Read hello.txt and tell me what it says.\"}]}")
+if printf '%s' "$R" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+ch = d["choices"][0]
+m = ch["message"]
+calls = m.get("tool_calls", [])
+ok = (
+    ch["finish_reason"] == "tool_calls"
+    and len(calls) == 1
+    and calls[0]["type"] == "function"
+    and calls[0]["id"]
+    and calls[0]["function"]["name"] == "read_file"
+    and json.loads(calls[0]["function"]["arguments"]).get("path", "").endswith("hello.txt")
+)
+sys.exit(0 if ok else 1)' 2>/dev/null; then
+  ok "/v1 turn 1 emits an OpenAI tool_calls message with finish_reason tool_calls"
+else
+  bad "/v1 tool call malformed or missing" "$(printf %.200s "$R")"
+fi
+CALLID=$(printf '%s' "$R" | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d["choices"][0]["message"].get("tool_calls",[{}])[0].get("id",""))' 2>/dev/null)
+CALLARGS=$(printf '%s' "$R" | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d["choices"][0]["message"].get("tool_calls",[{}])[0].get("function",{}).get("arguments","{}"))' 2>/dev/null)
+
+# Turn 2: the assistant's own call replayed in OpenAI's wire shape (arguments
+# as a STRING, tool_call_id present) plus the tool result, answered on the
+# template's <tool_response> rendering.
+R2=$(post /v1/chat/completions "{$V1REQ,\"messages\":[{\"role\":\"system\",\"content\":\"$V1SYS\"},{\"role\":\"user\",\"content\":\"Read hello.txt and tell me what it says.\"},{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"$CALLID\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":$(python3 -c "import json,sys;print(json.dumps(json.dumps(json.loads(sys.argv[1]))))" "$CALLARGS")}}]},{\"role\":\"tool\",\"tool_call_id\":\"$CALLID\",\"content\":\"hello from slotstream\"}]}")
+if printf '%s' "$R2" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+c = d["choices"][0]["message"].get("content") or ""
+sys.exit(0 if d["choices"][0]["finish_reason"] == "stop" and "hello from slotstream" in c else 1)' 2>/dev/null; then
+  ok "/v1 turn 2 accepts the replayed call and the tool result, and answers from it"
+else
+  bad "/v1 tool-result turn failed" "$(printf %.200s "$R2")"
+fi
+
+# Streaming: the call arrives as tool_calls fragments whose `arguments`
+# concatenate to the complete JSON object.
+python3 - "$PORT" <<'PYEOF' && ok "/v1 streamed tool call reassembles from fragments" || bad "/v1 streamed tool call" "fragments did not reassemble"
+import http.client, json, sys
+P = int(sys.argv[1])
+body = {
+    "model": "qwen3.8-flash-next:4bit", "stream": True, "tool_choice": "auto",
+    "max_tokens": 128, "stream_options": {"include_usage": True},
+    "tools": [{"type": "function", "function": {
+        "name": "read_file", "description": "Read a file from the workspace.",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}},
+                       "required": ["path"]}}}],
+    "messages": [
+        {"role": "system", "content": "You are a coding agent working in the user's workspace."},
+        {"role": "user", "content": "Read hello.txt and tell me what it says."},
+    ],
+}
+c = http.client.HTTPConnection("127.0.0.1", P, timeout=600)
+c.request("POST", "/v1/chat/completions", json.dumps(body), {"Content-Type": "application/json"})
+resp = c.getresponse().read().decode()
+c.close()
+calls, finish, usage = {}, None, False
+for line in resp.splitlines():
+    if not line.startswith("data: ") or line == "data: [DONE]":
+        continue
+    d = json.loads(line[6:])
+    if d.get("usage"):
+        usage = True
+    for ch in d.get("choices", []):
+        if ch.get("finish_reason"):
+            finish = ch["finish_reason"]
+        for tc in ch.get("delta", {}).get("tool_calls") or []:
+            slot = calls.setdefault(tc["index"], {"id": None, "name": None, "args": ""})
+            slot["id"] = tc.get("id") or slot["id"]
+            fn = tc.get("function") or {}
+            slot["name"] = fn.get("name") or slot["name"]
+            slot["args"] += fn.get("arguments") or ""
+assert finish == "tool_calls", f"finish_reason was {finish!r}"
+assert usage, "stream_options.include_usage produced no usage chunk"
+assert len(calls) == 1 and calls[0]["id"], f"calls: {calls}"
+slot = calls[0]
+assert slot["name"] == "read_file", slot
+assert json.loads(slot["args"]).get("path", "").endswith("hello.txt"), slot["args"]
+PYEOF
+
+# tool_choice none must render no tools: the model answers in prose and no
+# call appears even though the request declared one.
+R=$(post /v1/chat/completions "{\"model\":\"qwen3.8-flash-next:4bit\",\"stream\":false,\"tool_choice\":\"none\",\"max_tokens\":48,\"tools\":[$V1TOOL],\"messages\":[{\"role\":\"user\",\"content\":\"Read hello.txt and tell me what it says.\"}]}")
+if printf '%s' "$R" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+m = d["choices"][0]["message"]
+# The proof that no tools rendered is the answer itself: with no <tools>
+# block the model cannot call, so no tool_calls key and no tool_calls finish.
+sys.exit(0 if d["choices"][0]["finish_reason"] != "tool_calls" and not m.get("tool_calls")
+         and (m.get("content") or "").strip() else 1)' 2>/dev/null; then
+  ok "/v1 tool_choice none renders no tools and answers in prose"
+else
+  bad "/v1 tool_choice none still produced a call" "$(printf %.200s "$R")"
+fi
+
+# Refusals: every shape below is a request the server cannot honour, and each
+# is told so before the head goes out.
+for BAD in \
+    '"tool_choice":"mandatory","tools":['"$V1TOOL"']' \
+    '"tool_choice":{"type":"function","function":{}}' \
+    '"tool_choice":{"type":"function","function":{"name":"nope"}},"tools":['"$V1TOOL"']' \
+    '"tool_choice":"required"' \
+    '"tools":[{"type":"function","function":{"description":"no name"}}]' \
+    '"tools":[{"type":"function"}]' \
+; do
+  C=$(curl -s -o /dev/null -w '%{http_code}' --max-time 60 -X POST "http://127.0.0.1:$PORT/v1/chat/completions" \
+      -d "{\"model\":\"qwen3.8-flash-next:4bit\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],$BAD}")
+  [ "$C" = 400 ] && ok "/v1 refuses $BAD" || bad "/v1 accepted a broken tool request ($BAD)" "$C"
 done
 
 # --- think: reasoning belongs in `thinking`, not in the answer --------------

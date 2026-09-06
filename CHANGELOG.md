@@ -3,6 +3,22 @@
 What each release changed, newest first. `curl | sh` installs the latest
 release; anything under **Unreleased** is on `main` only.
 
+## Unreleased
+
+- **Tool calling on `/v1/chat/completions`.** The OpenAI-compatible endpoint
+  accepts `tools` and `tool_choice` instead of refusing them: declare
+  function tools, receive `message.tool_calls` with
+  `finish_reason: "tool_calls"` (streamed as incremental `arguments`
+  fragments that reassemble into the call), and feed results back as
+  `role: "tool"` turns with the assistant's call replayed in OpenAI's wire
+  shape. This is the same `<tool_call>` grammar and typed-argument coercion
+  the fx gateway serves, and whenever tools are live a request that leaves
+  `temperature`/`top_p`/`presence_penalty` unset uses the agent sampling
+  defaults (0.2 / 0.9 / 0) instead of the instruct ones. `tool_choice`
+  `required` and named tools steer the model with a system line rather than
+  constrain it; `parallel_tool_calls: true` is the accepted default and
+  `false` is refused, because nothing here can enforce it.
+
 ## 0.2.7 — 2026-09-04
 
 - **The model reads images.** The checkpoint has always carried a vision tower
